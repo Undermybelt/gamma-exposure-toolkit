@@ -240,7 +240,9 @@ if barstate.islast and str.length(srcText) > 0
                     string bucket = f_bucketOf(kind)
                     if f_visible(base, bucket)
                         color c = f_color(base)
-                        [int st, int wid] = f_bucketStyle(bucket)
+                        // Tuple destructuring: no type prefix inside the brackets
+                        // — Pine infers int from the function's declared return.
+                        [st, wid] = f_bucketStyle(bucket)
                         // The "All" bucket renders a touch wider and is drawn
                         // first so the per-expiry lines sit on top of it.
                         int useW = bucket == "all" ? math.max(wid, 2) : wid
