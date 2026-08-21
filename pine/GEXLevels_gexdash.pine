@@ -116,8 +116,9 @@ f_color(string base) =>
      : color.new(#7A7A85, 30)
 
 f_bucketStyle(string bucket) =>
-    // Pine ternaries cannot return tuples (CE10163); if/else branches each
-    // yield a [style, width] tuple for the caller to unpack.
+    // Returns [line_style:int, width:int]. Callers unpack with bare brackets:
+    //   [st, wid] = f_bucketStyle(bucket)
+    // (Pine v6: tuple unpacking takes no type prefix inside the brackets.)
     if bucket == "0dte"
         [f_lineStyle(s0), w0]
     else if bucket == "weekly"
@@ -240,8 +241,10 @@ if barstate.islast and str.length(srcText) > 0
                     string bucket = f_bucketOf(kind)
                     if f_visible(base, bucket)
                         color c = f_color(base)
-                        // Tuple destructuring: no type prefix inside the brackets
-                        // — Pine infers int from the function's declared return.
+                        // f_bucketStyle returns [style:int, width:int]. Per the
+                        // Pine v6 docs, tuple unpacking is bare brackets with no
+                        // type prefix: [a, b] = func(). Element types are inferred
+                        // from the function's declared return.
                         [st, wid] = f_bucketStyle(bucket)
                         // The "All" bucket renders a touch wider and is drawn
                         // first so the per-expiry lines sit on top of it.
