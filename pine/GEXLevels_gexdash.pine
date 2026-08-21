@@ -158,6 +158,7 @@ f_visible(string base, string bucket) =>
 var string gSym     = ""
 var string gSpot    = ""
 var float  gSpotF   = na  // numeric data-source spot, for the basis shift
+var float  gShift   = 0.0 // applied basis offset (chart price − data spot); global so the debug row can read it
 var string gState   = ""
 var string gBasis   = ""
 var string gAsof    = ""
@@ -239,12 +240,13 @@ if barstate.islast and str.length(srcText) > 0
     // from the chart symbol (NDX string on an NQ chart, SPX on ES). basis =
     // chart price now − data-source spot at snapshot time. On a same-symbol
     // chart it collapses to ~0. Ratio-type pairs (SPY/SPX, QQQ/NDX) are NOT
-    // handled — turn the toggle off there.
-    float basis = basisShift and not na(gSpotF) and gSpotF > 0 ? close - gSpotF : 0.0
+    // handled — turn the toggle off there. Stored in the gShift global so the
+    // debug row (a separate top-level block) can read it.
+    gShift := basisShift and not na(gSpotF) and gSpotF > 0 ? close - gSpotF : 0.0
 
     // One small label under the last bar summarising the snapshot — tells the
     // eye immediately whether the chart is live or carried-forward.
-    string stamp = gSym + (gSym == "" ? "" : "  ") + gNetGex + (gIV == "" ? "" : "  IV " + gIV) + (gRV == "" ? "" : "  RV " + gRV) + (math.abs(basis) > syminfo.mintick ? "  基差" + (basis > 0 ? "+" : "") + str.tostring(basis, "#.#") : "")
+    string stamp = gSym + (gSym == "" ? "" : "  ") + gNetGex + (gIV == "" ? "" : "  IV " + gIV) + (gRV == "" ? "" : "  RV " + gRV) + (math.abs(gShift) > syminfo.mintick ? "  基差" + (gShift > 0 ? "+" : "") + str.tostring(gShift, "#.#") : "")
     if stamp != ""
         headerLabel := label.new(bar_index + labelOff, low - ta.tr, stamp, style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.new(#787B86, 0), size = size.tiny)
 
@@ -261,7 +263,7 @@ if barstate.islast and str.length(srcText) > 0
                 string lbl = array.get(f, 1)
                 string kind = array.get(f, 2)
                 if not na(p) and p > 0
-                    float y = p + basis  // chart-space price after the basis shift
+                    float y = p + gShift  // chart-space price after the basis shift
                     string base = f_baseKind(kind)
                     string bucket = f_bucketOf(kind)
                     if f_visible(base, bucket)
@@ -366,6 +368,6 @@ if showPanel and barstate.islast
 var table dbg = table.new(position.top_left, 1, 1)
 if showDebug and barstate.islast
     int dLen = str.length(srcText)
-    string dbgMsg = "数据 " + str.tostring(dLen) + " 字 · 行 " + str.tostring(dbgRows) + " · 画 " + str.tostring(dbgDrawn) + (gSym == "" ? "" : " · " + gSym) + (na(basis) or basis == 0 ? "" : " · 基差" + (basis > 0 ? "+" : "") + str.tostring(basis, "#.#"))
+    string dbgMsg = "数据 " + str.tostring(dLen) + " 字 · 行 " + str.tostring(dbgRows) + " · 画 " + str.tostring(dbgDrawn) + (gSym == "" ? "" : " · " + gSym) + (gShift == 0 ? "" : " · 基差" + (gShift > 0 ? "+" : "") + str.tostring(gShift, "#.#"))
     color dbgBg = dLen == 0 ? color.new(#EF5350, 10) : dbgDrawn == 0 ? color.new(#F0B90B, 10) : color.new(#26A69A, 10)
     table.cell(dbg, 0, 0, dbgMsg, text_color = color.white, text_size = size.small, bgcolor = dbgBg)
