@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "GEXdash TradingView Bridge",
+  "version": "0.1.0",
+  "description": "Fetch dealer gamma exposure from gexdash.com and fill the GEX Levels Pine indicator's data field on TradingView with one click.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://gexdash.com/"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.tradingview.com/*", "https://tradingview.com/*"],
+      "js": ["content.js"],
+      "css": ["panel.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  }
+}

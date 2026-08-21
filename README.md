@@ -6,14 +6,20 @@ Four expiry buckets — **0DTE / Weekly / Monthly / All** — ride in one string
 
 > gexdash always serves its most recent snapshot: during US regular hours that's the live chain; outside RTH it's the previous close carried forward. The CLI labels which one you got (`today-live` vs `prior-close`) and that label rides into the Pine panel, so a stale paste reads as stale on the chart.
 
-## Quick start
+## Two ways to get the string into the indicator
+
+### A. CLI (copy-paste)
 
 ```bash
-# One symbol → prints the string + copies it to the clipboard (macOS pbcopy)
-python3 -m gextv.cli QQQ
-
-# Then paste into the indicator's "GEX data string" field in TradingView.
+python3 -m gextv.cli QQQ     # prints + copies the string
+# paste into the indicator's "GEX data string" field in TradingView
 ```
+
+### B. Chrome extension (one-click)
+
+For no-copy-paste: load `extension/` as an unpacked extension. It fetches gexdash from its background worker, builds the **same** level string the CLI does, and fills the indicator's data field with one click (clipboard fallback if it cannot find the field). See `extension/README.md`.
+
+Why a bridge is needed: TradingView's Pine sandbox cannot reach `gexdash.com` — Pine has no HTTP-fetch primitive, only `request.security` for exchange data. The indicator itself stays a pure string-parsing Pine script; the bridge (CLI or extension) does the network work that Pine is not allowed to do.
 
 Output (QQQ, evening snapshot):
 ```
@@ -92,11 +98,19 @@ gextv/
   snapshot.py   # normalised multi-expiry Snapshot
   emit.py       # emits the wire-format string
   cli.py        # command-line entry point (prints + pbcopy)
+extension/
+  manifest.json   # MV3 manifest; host_permissions = gexdash.com only
+  background.js  # service worker — fetches gexdash, runs ported analytics+emitter
+  content.js     # injects panel on tradingview.com, fills the indicator textarea
+  panel.css      # panel styling
+  README.md      # install + use
 pine/
   GEXLevels_gexdash.pine   # the TradingView indicator (paste the string into it)
 tests/
   test_pipeline.py         # analytics + emitter + Pine↔Python parser contract (offline)
 ```
+
+The extension's `background.js` ports `analytics.py` + `emit.py` to JS so the CLI and the extension emit byte-identical strings. Comments there mark the ports; keep them in sync when you change the Python.
 
 ## The Pine indicator
 
