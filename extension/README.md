@@ -18,6 +18,11 @@ TradingView's Pine sandbox cannot reach `gexdash.com`, so the indicator still on
 3. Click **加载并填入 (Load & fill)**. On success the field is written and the string is *also* copied to the clipboard; click **OK** in the settings dialog to save.
 4. If auto-fill misses, the string is already in your clipboard — just Ctrl/Cmd-V into the field. To stop relying on the DOM heuristics altogether, click **绑定输入框 (Bind field)**, then click the GEX data textarea once; the extension binds that exact element for this page load and fills it directly on every subsequent 「加载并填入」.
 
+### Auto-poll and full-auto
+
+- **自动刷新** re-fetches gexdash on an interval and rewrites the field. It defaults to **every 1 minute** — gexdash's own snapshot updates every 30 s, so one minute is enough — until you save an explicit choice; 关 turns it off and is remembered.
+- **全自动（自动开设置+点OK）** closes the loop: after filling the field it clicks the settings dialog's OK button for you, and when the dialog is closed it reopens it through the indicator's ⚙ button. To arm that path, click **绑定输入框** and then click the ⚙ button (instead of the textarea) — the extension binds it as the reopen handle. With full-auto on, data flows from gexdash to a committed chart with zero manual steps; if the OK button can't be found, the status line says so and the string is still in the clipboard.
+
 ### Why there are two fill paths
 
 TradingView renders its settings fields with obfuscated class names that change between releases, and the fields are framework-controlled — a plain `.value =` assignment is often ignored or reverted. The extension therefore:

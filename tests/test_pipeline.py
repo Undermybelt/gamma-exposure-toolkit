@@ -230,6 +230,92 @@ class PineContractTest(unittest.TestCase):
             self.assertGreater(price, 0.0)
 
 
+# ─────────────── Pine ↔ Python conversion contract (v11) ──────────────────
+# The Pine indicator's 自动 mode resolves the price-space conversion in a
+# fixed order: symbol-pair table → ratio conversion → raw prices. This class
+# mirrors that decision tree so a changed pair constant, a new chart root, or
+# a moved guard breaks the tests before it breaks the chart.
+class PineConversionContractTest(unittest.TestCase):
+    PAIR_MULT = {
+        ("SPX", "ES"): 1.0, ("SPX", "MES"): 0.1,
+        ("SPY", "ES"): 10.0, ("SPY", "MES"): 1.0,
+        ("NDX", "NQ"): 1.0, ("NDX", "MNQ"): 0.1,
+        ("QQQ", "NQ"): 40.0, ("QQQ", "MNQ"): 4.0,
+    }
+
+    def _auto_conv(self, dsym: str, root: str, close: float, spot: float | None,
+                   ticker: str | None = None):
+        """Returns (conv, shift, mode) exactly as the Pine 自动 branch does."""
+        if spot is None or spot <= 0:
+            return 1.0, 0.0, "无spot"
+        dsym = dsym.upper()
+        # Same instrument → strikes are already this chart's prices; pin them
+        # at face value regardless of any gap since the snapshot.
+        if dsym == root or dsym == (ticker or root):
+            return 1.0, 0.0, "同品种"
+        # Sanity gate BEFORE the pair table: a corrupt spot must never reach a
+        # fixed multiplier, or it turns into a huge additive shift.
+        ratio = close / spot
+        if not (0.005 < ratio < 50.0):
+            return 1.0, 0.0, "异常"
+        pm = self.PAIR_MULT.get((dsym, root))
+        if pm is not None:
+            return pm, close - pm * spot, "配对"
+        return ratio, close - ratio * spot, "比例"
+
+    def test_futures_pairs_use_exact_contract_scale(self):
+        # (data sym, chart root) -> (chart close, data spot)
+        cases = {
+            ("NDX", "NQ"): (23750.0, 23500.0),
+            ("NDX", "MNQ"): (2352.0, 23480.0),
+            ("QQQ", "NQ"): (23750.0, 595.0),
+            ("QQQ", "MNQ"): (2375.0, 595.0),
+            ("SPX", "ES"): (6480.0, 6450.0),
+            ("SPX", "MES"): (647.5, 6450.0),
+            ("SPY", "ES"): (6480.0, 645.0),
+            ("SPY", "MES"): (647.5, 645.0),
+        }
+        for (dsym, root), (close, spot) in cases.items():
+            conv, shift, mode = self._auto_conv(dsym, root, close, spot)
+            self.assertEqual(mode, "配对", (dsym, root))
+            # The snapshot spot must land exactly on the live chart price.
+            self.assertAlmostEqual(spot * conv + shift, close, places=6)
+
+    def test_etf_and_unknown_pairs_use_ratio_conversion(self):
+        # SPX string on a SPY chart: no fixed-scale pair → ratio path.
+        conv, shift, mode = self._auto_conv("SPX", "SPY", 645.10, 6450.0)
+        self.assertEqual(mode, "比例")
+        self.assertAlmostEqual(conv, 645.10 / 6450.0)
+        self.assertAlmostEqual(shift, 0.0, places=9)
+        # Same-symbol chart pins raw prices (see the 同品种 test below).
+        conv, _, mode = self._auto_conv("QQQ", "QQQ", 709.32, 709.32)
+        self.assertEqual((mode, conv), ("同品种", 1.0))
+
+    def test_same_symbol_pins_strikes_at_face_value(self):
+        # A post-snapshot gap must NOT drag fixed option strikes: SPY string
+        # (spot 762.60) on a SPY chart now trading 771.20 renders CW at 770.00.
+        self.assertEqual(self._auto_conv("SPY", "SPY", 771.20, 762.60),
+                         (1.0, 0.0, "同品种"))
+        # Futures-style tickers compare against the root too (NQ1! → NQ).
+        self.assertEqual(self._auto_conv("NDX", "NQ", 23750.0, 23500.0,
+                                         ticker="NQ1!"),
+                         (1.0, 23750.0 - 23500.0, "配对"))
+
+    def test_implausible_ratio_falls_back_to_raw_prices(self):
+        # A garbage spot (ratio far outside any real instrument pairing) must
+        # not scatter levels across the axis. Plausible-but-unfamiliar ratios
+        # (e.g. an index string on an unrelated stock, or DIA↔DJI ≈ ×0.01)
+        # intentionally stay on the ratio path — only extremes are rejected.
+        self.assertEqual(self._auto_conv("NDX", "NQ", 23750.0, 1.0),
+                         (1.0, 0.0, "异常"))
+        _, _, mode = self._auto_conv("SPX", "AAPL", 230.0, 6450.0)
+        self.assertEqual(mode, "比例")
+
+    def test_missing_spot_reports_no_conversion(self):
+        self.assertEqual(self._auto_conv("NDX", "NQ", 23750.0, None),
+                         (1.0, 0.0, "无spot"))
+
+
 # ───────────────────────── client validation ─────────────────────────────
 class ClientGuardTest(unittest.TestCase):
     def test_rejects_unlisted_symbol(self):

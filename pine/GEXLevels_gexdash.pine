@@ -30,13 +30,15 @@ indicator("GEX Levels — gexdash", overlay = true, max_lines_count = 500, max_l
 
 // ──────────────────────────────── INPUTS ────────────────────────────────
 const string TIP = "Paste the string from `python3 -m gextv.cli <SYMBOL>`. Format: M:key=value|L:price,label,kind;..."
-const string IND_VER = "v10"
+const string IND_VER = "v12"
 string srcText = input.text_area("", "GEX data string", group = "GEX Data", tooltip = TIP)
 string basisMode = input.string("自动（按现价识别）", "价位换算", group = "GEX Data", options =
      ["自动（按现价识别）", "手动（倍数+价差）", "关闭（原价）"], tooltip =
      "换算公式：图表价位 = 数据价位 × 倍数 + 价差 —— 与参考脚本 f_convertPrice(S:价差/R:倍率) 同一套。\n"
-     + "自动：按 图表现价÷数据spot 的比值定倍数，价差 = 现价 − 倍数×spot。同品种图≈原价。\n"
-     + "手动：自己填倍数和价差。例：NDX串→NQ图 填 1 和 (NQ−NDX) 差值；NDX串→MNQ图 填 0.1。\n"
+     + "自动：① 数据品种=图表品种 → 直接原价（行权价是绝对价位，不随快照后跳空漂移）；\n"
+     + "② 期货图查 品种配对表（合约固定倍数+基差价差：NDX→NQ ×1、NDX→MNQ ×0.1、SPX→ES ×1、QQQ→NQ ×40…）；\n"
+     + "③ 其余按 图表现价÷数据spot 的比例换算（价差≈0），ETF↔指数跟踪误差自动校准。\n"
+     + "手动：自己填倍数和价差，不依赖数据串里的 spot。例：NDX串→NQ图 填 1 和 (NQ−NDX) 差值；NDX串→MNQ图 填 0.1。\n"
      + "关闭：显示数据原始价位。")
 float manualMult   = input.float(1.0, "手动倍数", minval = 0.0001, step = 0.005, group = "GEX Data")
 float manualSpread = input.float(0.0, "手动价差（换算后加上）", step = 0.25, group = "GEX Data")
@@ -46,11 +48,14 @@ bool sh0   = input.bool(true,  "0DTE",   group = "Expiry buckets", inline = "e")
 bool shW   = input.bool(true,  "Weekly", group = "Expiry buckets", inline = "e")
 bool shM   = input.bool(true,  "Monthly", group = "Expiry buckets", inline = "e")
 bool shAll = input.bool(true,  "All-expiry", group = "Expiry buckets", inline = "e")
+string soloMode = input.string("全部", "只显示（快速切换）", options =
+     ["全部", "仅0DTE", "仅Weekly", "仅Monthly", "仅All"], group = "Expiry buckets",
+     tooltip = "一键只看某一个到期桶：选中后忽略上面的四个开关，只画对应的桶。\n（Pine 的表格收不到点击，所以切换入口放在设置下拉里。）")
 
 // Independent levels (max pain, OI walls, EM/IV bands).
 bool shMpain = input.bool(true,  "Max pain", group = "Independent levels", inline = "i1")
 bool shOI    = input.bool(true,  "OI walls (call/put/max)", group = "Independent levels", inline = "i1")
-bool shEM    = input.bool(true,  "Expected move", group = "Independent levels", inline = "i2")
+bool shEM    = input.bool(false, "Expected move", group = "Independent levels", inline = "i2")
 bool shIV    = input.bool(true,  "IV 1-day range", group = "Independent levels", inline = "i2")
 
 // Style
@@ -63,6 +68,8 @@ string labelSide   = input.string("自动错开", "标签位置", options = ["�
      + "线上方/线下方：全部标签统一放线上方/下方。\n"
      + "线上居中：标签气泡中线对齐价位（旧默认样式）。")
 float  labelGapPct = input.float(0.05, "自动错开：相邻间距阈值（价格%）", minval = 0.001, maxval = 5.0, step = 0.01, group = "Style", tooltip = "相邻标签价格差小于当前价的此百分比时视为重叠，上下交替错开。数值越大越早错开。")
+int    hStepBars = input.int(3, "横向错开间距（K线）", minval = 0, maxval = 50, group = "Style", tooltip = "自动错开时，同一重叠组内第 n 个标签向右挪 n×此值的水平距离，纵向横向同时错开、依次排开。")
+string dbgPos   = input.string("Top left", "调试行位置", options = ["Top left", "Top right", "Bottom left", "Bottom right"], group = "Style")
 bool   showDebug  = input.bool(true,  "调试行（排查显示用）", group = "Style")
 
 // Expiry bucket line styles (0DTE solid, Weekly dashed, Monthly dotted, All thick)
@@ -79,6 +86,7 @@ int    wA = input.int(3,           "All-expiry width", minval = 1, maxval = 4, g
 bool   showPanel = input.bool(true, "Show legend panel", group = "Legend panel")
 string panelPos = input.string("Top right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = "Legend panel")
 string panelSize = input.string("Tiny", "Panel text size", options = ["Tiny", "Small", "Normal"], group = "Legend panel")
+color  panelBg  = input.color(color.new(#1E222D, 10), "面板底色", group = "Legend panel", tooltip = "整块面板的背景色，默认深色半透明，浅色主题下也可自行调深。")
 
 // Colors
 color cCall   = input.color(#26A69A, "Call wall",  group = "Colors", inline = "c1")
@@ -143,9 +151,36 @@ f_bucketStyle(string bucket) =>
     else
         [f_lineStyle(sA), wA]
 
+// ── 品种配对表 ──
+// Chart roots that are derivatives of the data symbol's index carry an exact
+// contract scale: the multiplier is fixed by the contract spec and never
+// drifts, so the additive residual (close − mult×spot) cleanly carries the
+// futures basis. Returns na for pairs without a fixed scale — the caller then
+// falls back to ratio conversion (close ÷ spot), which self-calibrates
+// ETF↔index tracking drift instead of hard-coding one.
+// Keyed on syminfo.root so NQ1! / NQU6 / MNQ1! all resolve to their root.
+f_pairMult(string dsym, string root) =>
+    float m = na
+    if dsym == "SPX" and (root == "ES" or root == "MES")
+        m := root == "ES" ? 1.0 : 0.1
+    else if dsym == "SPY" and (root == "ES" or root == "MES")
+        m := root == "ES" ? 10.0 : 1.0
+    else if dsym == "NDX" and (root == "NQ" or root == "MNQ")
+        m := root == "NQ" ? 1.0 : 0.1
+    else if dsym == "QQQ" and (root == "NQ" or root == "MNQ")
+        m := root == "NQ" ? 40.0 : 4.0
+    m
+
 // Is a kind visible given the current settings?
 f_visible(string base, string bucket) =>
-    bool bucketOn = bucket == "0dte" ? sh0 : bucket == "weekly" ? shW : bucket == "monthly" ? shM : shAll
+    // 只显示（快速切换）overrides the four per-bucket toggles: when a solo
+    // bucket is picked, only that bucket renders.
+    bool bucketOn =
+         soloMode == "仅0DTE" ? bucket == "0dte"
+         : soloMode == "仅Weekly" ? bucket == "weekly"
+         : soloMode == "仅Monthly" ? bucket == "monthly"
+         : soloMode == "仅All" ? bucket == "all"
+         : bucket == "0dte" ? sh0 : bucket == "weekly" ? shW : bucket == "monthly" ? shM : shAll
     if not bucketOn
         false
     else if base == "res" or base == "sup" or base == "flip" or base == "gwall" or base == "vtrig" or base == "hgex" or base == "gpos" or base == "gneg"
@@ -161,22 +196,39 @@ f_visible(string base, string bucket) =>
     else
         false
 
+// ISO-8601 "2026-08-21T08:03:46[.frac][Z]" -> UTC epoch ms (na on failure).
+// Only the first 19 chars matter; fractional seconds and the Z are ignored.
+f_isoMs(string s) =>
+    int ms = na
+    if str.length(s) >= 19
+        int y  = math.round(str.tonumber(str.substring(s, 0, 4)))
+        int mo = math.round(str.tonumber(str.substring(s, 5, 7)))
+        int d  = math.round(str.tonumber(str.substring(s, 8, 10)))
+        int hh = math.round(str.tonumber(str.substring(s, 11, 13)))
+        int mi = math.round(str.tonumber(str.substring(s, 14, 16)))
+        int ss = math.round(str.tonumber(str.substring(s, 17, 19)))
+        if not (na(y) or na(mo) or na(d) or na(hh) or na(mi) or na(ss))
+            ms := timestamp("UTC", y, mo, d, hh, mi, ss)
+    ms
+
 // ──────────────────────────── METADATA PARSER ────────────────────────────
 // The M: header is M:k=v,k=v|... . Parse once on the first bar; values are
 // surfaced in the legend panel and used to label the snapshot as live vs stale.
 var string gSym     = ""
 var string gSpot    = ""
 var float  gSpotF   = na  // numeric data-source spot, for the conversion
-var float  gConv    = 1.0 // multiplier: 1 index↔full futures, 0.1 micro/SPY, 0.025 QQQ≈NDX
+var float  gConv    = 1.0 // multiplier: pair-table constant or close÷spot ratio
 var float  gShift   = 0.0 // additive offset: chart price − gConv × data spot
 var string gState   = ""
 var string gBasis   = ""
 var string gAsof    = ""
+var int    gAsofMs  = na  // asof as UTC epoch ms, for data age + UTC-4 display
 var string gSrc     = ""
 var string gNetGex  = ""
 var string gIV      = ""
 var string gRV      = ""
 var string gOiPc    = ""
+var string gConvMode = "" // how the conversion resolved: 配对/比例/异常/无spot/手动/关闭
 
 // The M: header is parsed inline in the main scope below, not in a function:
 // Pine v6 (CE10088) forbids mutating var globals from inside a function, and
@@ -235,6 +287,7 @@ if barstate.islast and str.length(srcText) > 0
                 gBasis := val
             else if key == "asof"
                 gAsof := val
+                gAsofMs := f_isoMs(val)
             else if key == "src"
                 gSrc := val
             else if key == "ng"
@@ -249,21 +302,59 @@ if barstate.islast and str.length(srcText) > 0
     // Price-space conversion so pasted levels land on THIS chart's vertical
     // axis: chart_price = data_price × gConv + gShift — the same model as the
     // reference scripts' f_convertPrice (S: spread / R: ratio), generalized.
-    // 自动 snaps gConv from close ÷ spot ratio bands and pins the snapshot
-    // spot onto the live chart price; 手动 takes the user's multiplier and
-    // spread verbatim; 关闭 renders raw data prices. Globals so the debug row
-    // (a separate top-level block) can read them.
+    // v11 自动 resolution order:
+    //   0. Same instrument as the data — raw prices; strikes are absolute.
+    //   1. 品种配对表 (f_pairMult) — data sym × chart root with an exact
+    //      contract scale (futures): fixed multiplier, additive basis shift.
+    //   2. Everything else — pure ratio conversion: mult = close ÷ spot,
+    //      shift ≈ 0. Self-calibrates ETF↔index tracking and overnight gaps.
+    //   3. Implausible ratio or no parsable spot — raw prices, and the debug
+    //      row says which mode fired.
+    // 手动 takes the user's multiplier and spread verbatim and no longer
+    // requires a parsable spot: v10 gated ALL conversion behind `canConvert`,
+    // so a header-less paste silently ignored the user's own multiplier and
+    // every level stayed at raw data prices ("levels never move").
     bool canConvert = not na(gSpotF) and gSpotF > 0
-    if not canConvert or basisMode == "关闭（原价）"
+    gConvMode := ""
+    if basisMode == "关闭（原价）"
         gConv := 1.0
         gShift := 0.0
+        gConvMode := "关闭"
     else if basisMode == "手动（倍数+价差）"
         gConv := manualMult
         gShift := manualSpread
-    else
+        gConvMode := "手动"
+    else if canConvert
+        // Sanity gate FIRST: a corrupt spot must never reach the pair table,
+        // or a fixed multiplier turns it into a huge additive shift that
+        // scatters every level off the axis.
         float ratio = close / gSpotF
-        gConv := ratio >= 9.0 and ratio <= 11.0 ? 10.0 : ratio >= 0.09 and ratio <= 0.11 ? 0.1 : ratio >= 0.022 and ratio <= 0.028 ? 0.025 : 1.0
-        gShift := close - gConv * gSpotF
+        // Same instrument as the data → strikes are already this chart's
+        // prices. Pin them at face value: scaling by close÷spot would drag
+        // fixed option strikes whenever the snapshot predates a gap.
+        string dsymU = str.upper(gSym)
+        if dsymU == syminfo.root or dsymU == syminfo.ticker
+            gConv := 1.0
+            gShift := 0.0
+            gConvMode := "同品种"
+        else if ratio > 0.005 and ratio < 50.0
+            float pairMult = f_pairMult(dsymU, syminfo.root)
+            if not na(pairMult)
+                gConv := pairMult
+                gShift := close - gConv * gSpotF
+                gConvMode := "配对"
+            else
+                gConv := ratio
+                gShift := close - gConv * gSpotF
+                gConvMode := "比例"
+        else
+            gConv := 1.0
+            gShift := 0.0
+            gConvMode := "异常" // spot vs chart price implausible — raw prices
+    else
+        gConv := 1.0
+        gShift := 0.0
+        gConvMode := "无spot"
 
     // One small label under the last bar summarising the snapshot — tells the
     // eye immediately whether the chart is live or carried-forward.
@@ -331,23 +422,31 @@ if barstate.islast and str.length(srcText) > 0
             float gapPx = close * labelGapPct / 100.0
             bool above = true
             float prevY = na
+            int runIdx = 0 // position within the current overlap run
             for i = 0 to nL - 1
                 float y = array.get(lblY, i)
                 string txt = array.get(lblTxt, i)
                 color c = array.get(lblCol, i)
                 lstyle = label.style_label_left
+                int xOff = labelOff
                 if labelSide == "自动错开"
+                    // Stagger on BOTH axes: inside an overlap run, labels
+                    // alternate above/below AND step right by hStepBars each,
+                    // so they read as an ordered diagonal cascade.
                     if na(prevY) or (y - prevY) > gapPx
                         above := true   // clear of the previous label: reset to top
+                        runIdx := 0
                     else
                         above := not above
+                        runIdx += 1
+                    xOff += runIdx * hStepBars
                     lstyle := above ? label.style_label_up : label.style_label_down
                 else if labelSide == "线上方"
                     lstyle := label.style_label_up
                 else if labelSide == "线下方"
                     lstyle := label.style_label_down
                 prevY := y
-                array.push(lbs, label.new(bar_index + labelOff, y, txt, style = lstyle, color = color.new(color.black, 100), textcolor = c, size = f_size(labelSize)))
+                array.push(lbs, label.new(bar_index + xOff, y, txt, style = lstyle, color = color.new(color.black, 100), textcolor = c, size = f_size(labelSize)))
 
 // ─────────────────────────── LEGEND / ABBREVIATION PANEL ─────────────────
 // Surfaces (a) the snapshot status and (b) what every abbreviation means, so a
@@ -355,87 +454,105 @@ if barstate.islast and str.length(srcText) > 0
 // user-selectable so it does not fight the price axis on any layout.
 var table panel = table.new(position.top_right, 2, 24, border_width = 0)
 
-f_panelPos() =>
-    panelPos == "Top right" ? position.top_right
-     : panelPos == "Top left" ? position.top_left
-     : panelPos == "Bottom right" ? position.bottom_right
+// Shared by the legend panel and the debug row (Pine has no table.set_position,
+// so both recreate their table when the corner setting changes).
+f_corner(string p) =>
+    p == "Top right" ? position.top_right
+     : p == "Top left" ? position.top_left
+     : p == "Bottom right" ? position.bottom_right
      : position.bottom_left
 
 if showPanel and barstate.islast
     // Rebuild at the chosen position each time settings change.
     table.clear(panel, 0, 0, 1, 23)
-    // table.position is fixed at construction; when the user flips position we
-    // recreate the table. Pine has no table.set_position, so detect a change
-    // via a var guard.
     var string lastPos = ""
     if lastPos != panelPos
         lastPos := panelPos
-        panel := table.new(f_panelPos(), 2, 24, border_width = 0)
+        panel := table.new(f_corner(panelPos), 2, 24, border_width = 0)
 
     // size.* constants are a distinct type, not int — leave pSz untyped so Pine
     // infers it from the ternary (CE10173 if declared `int`).
     pSz = panelSize == "Tiny" ? size.tiny : panelSize == "Small" ? size.small : size.normal
     int r = 0
 
-    // Header row: symbol + snapshot basis (live / prior-close).
-    table.cell(panel, 0, r, "GEX " + (gSym == "" ? "?" : gSym), text_color = #F0B90B, text_size = pSz, text_halign = text.align_left)
-    table.cell(panel, 1, r, gBasis == "" ? "" : gBasis, text_color = gBasis == "today-live" ? #26A69A : #787B86, text_size = pSz, text_halign = text.align_left)
+    // Header row: symbol + snapshot basis (live / prior-close) + solo bucket.
+    table.cell(panel, 0, r, "GEX " + (gSym == "" ? "?" : gSym), text_color = #F0B90B, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
+    table.cell(panel, 1, r, (gBasis == "" ? "" : gBasis) + (soloMode == "全部" ? "" : " · " + soloMode), text_color = gBasis == "today-live" ? #26A69A : #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
     r += 1
 
-    // Snapshot line: spot, net gamma, IV / RV, age.
-    table.cell(panel, 0, r, "spot / netGEX", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
-    table.cell(panel, 1, r, (gSpot == "" ? "—" : gSpot) + "  " + (gNetGex == "" ? "" : gNetGex), text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
+    // Net gamma (spot intentionally not shown — the axis has it).
+    table.cell(panel, 0, r, "netGEX", text_color = #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
+    table.cell(panel, 1, r, gNetGex == "" ? "—" : gNetGex, text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
     r += 1
     if gIV != "" or gRV != ""
-        table.cell(panel, 0, r, "IV / RV %", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
-        table.cell(panel, 1, r, (gIV == "" ? "—" : gIV) + " / " + (gRV == "" ? "—" : gRV), text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
+        table.cell(panel, 0, r, "IV / RV %", text_color = #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
+        table.cell(panel, 1, r, (gIV == "" ? "—" : gIV) + " / " + (gRV == "" ? "—" : gRV), text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
         r += 1
-    if gAsof != ""
-        table.cell(panel, 0, r, "as of (UTC)", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
-        // Trim the fractional seconds for the panel.
-        table.cell(panel, 1, r, str.substring(gAsof, 0, math.min(str.length(gAsof), 19)) + "Z", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+    if not na(gAsofMs)
+        // Snapshot time in UTC-4 (US Eastern) + age of the data.
+        int mm4 = month(gAsofMs, "UTC-4")
+        int dd4 = dayofmonth(gAsofMs, "UTC-4")
+        int hh4 = hour(gAsofMs, "UTC-4")
+        int mi4 = minute(gAsofMs, "UTC-4")
+        string ts4 = (mm4 < 10 ? "0" : "") + str.tostring(mm4) + "-" + (dd4 < 10 ? "0" : "") + str.tostring(dd4) + " " + (hh4 < 10 ? "0" : "") + str.tostring(hh4) + ":" + (mi4 < 10 ? "0" : "") + str.tostring(mi4)
+        float ageMin = (timenow - gAsofMs) / 60000.0
+        string ageTxt = ageMin < 0 ? "?" : ageMin < 90.0 ? str.tostring(math.round(ageMin)) + "分前" : str.tostring(ageMin / 60.0, "#.#") + "时前"
+        table.cell(panel, 0, r, "as of (UTC-4)", text_color = #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
+        table.cell(panel, 1, r, ts4 + " · " + ageTxt, text_color = ageMin > 120.0 ? #F0B90B : #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
         r += 1
     if gOiPc != ""
-        table.cell(panel, 0, r, "OI P/C", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
-        table.cell(panel, 1, r, gOiPc, text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
+        table.cell(panel, 0, r, "OI P/C", text_color = #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
+        table.cell(panel, 1, r, gOiPc, text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
         r += 1
 
     // Separator.
     r += 0
-    table.cell(panel, 0, r, "─ levels ─", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
-    table.cell(panel, 1, r, "", text_color = #787B86, text_size = pSz)
+    table.cell(panel, 0, r, "─ levels ─", text_color = #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
+    table.cell(panel, 1, r, "", text_color = #787B86, text_size = pSz, bgcolor = panelBg)
     r += 1
 
     // Abbreviation glossary. Each row: short name → explanation.
     array<string> names  = array.from("CW / PW", "flip", "gwall", "vtrig", "hgex", "G+ / G-", "mpain", "oic/oip", "emh/eml", "ivh/ivl")
     array<string> expls  = array.from("call / put wall", "gamma flip", "gamma wall", "vol trigger", "max |GEX| strike", "most ± net-GEX", "max pain (OI)", "largest OI strike", "expected move ±", "1-day IV range")
     for i = 0 to array.size(names) - 1
-        table.cell(panel, 0, r, array.get(names, i), text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
-        table.cell(panel, 1, r, array.get(expls, i), text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+        table.cell(panel, 0, r, array.get(names, i), text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
+        table.cell(panel, 1, r, array.get(expls, i), text_color = #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
         r += 1
 
     // Bucket legend: which line style is which expiry.
-    table.cell(panel, 0, r, "0DTE", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
-    table.cell(panel, 1, r, s0 + " w" + str.tostring(w0), text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+    table.cell(panel, 0, r, "0DTE", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
+    table.cell(panel, 1, r, s0 + " w" + str.tostring(w0), text_color = #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
     r += 1
-    table.cell(panel, 0, r, "Weekly", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
-    table.cell(panel, 1, r, sW + " w" + str.tostring(wW), text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+    table.cell(panel, 0, r, "Weekly", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
+    table.cell(panel, 1, r, sW + " w" + str.tostring(wW), text_color = #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
     r += 1
-    table.cell(panel, 0, r, "Monthly", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
-    table.cell(panel, 1, r, sM + " w" + str.tostring(wM), text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+    table.cell(panel, 0, r, "Monthly", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
+    table.cell(panel, 1, r, sM + " w" + str.tostring(wM), text_color = #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
     r += 1
-    table.cell(panel, 0, r, "All-exp", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
-    table.cell(panel, 1, r, sA + " w" + str.tostring(wA), text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+    table.cell(panel, 0, r, "All-exp", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
+    table.cell(panel, 1, r, sA + " w" + str.tostring(wA), text_color = #787B86, text_size = pSz, text_halign = text.align_left, bgcolor = panelBg)
 
 // ─────────────────────────────── DEBUG ROW ───────────────────────────────
 // Instruments the parse pipeline so a silent no-render is diagnosable from a
 // screenshot: 数据 0 → the paste never committed to the input; 行>0 画 0 →
 // every level was filtered out; 画>0 but nothing on the chart → the chart
 // symbol's price scale doesn't cover the levels (wrong symbol family).
-var table dbg = table.new(position.top_left, 1, 2)
+var table dbg = table.new(position.top_left, 1, 3)
 if showDebug and barstate.islast
+    // Position is fixed at construction; recreate when the setting changes
+    // (same pattern as the legend panel).
+    var string lastDbgPos = ""
+    if lastDbgPos != dbgPos
+        lastDbgPos := dbgPos
+        dbg := table.new(f_corner(dbgPos), 1, 3, border_width = 0)
     int dLen = str.length(srcText)
     string dbgMsg = IND_VER + " · 数据 " + str.tostring(dLen) + " 字 · 行 " + str.tostring(dbgRows) + " · 画 " + str.tostring(dbgDrawn) + (gSym == "" ? "" : " · " + gSym)
     color dbgBg = dLen == 0 ? color.new(#EF5350, 10) : dbgDrawn == 0 ? color.new(#F0B90B, 10) : color.new(#26A69A, 10)
     table.cell(dbg, 0, 0, dbgMsg, text_color = color.white, text_size = size.small, bgcolor = dbgBg)
-    table.cell(dbg, 0, 1, "现价 " + str.tostring(close, format.mintick) + " · spot " + (na(gSpotF) ? "—" : str.tostring(gSpotF, "#.##")) + " · ×" + str.tostring(gConv, "#.###") + " · 价差" + (gShift >= 0 ? "+" : "") + str.tostring(gShift, "#.##"), text_color = color.white, text_size = size.small, bgcolor = color.new(#1E222D, 10))
+    // No spot/现价 readout here by design — the user doesn't want the spot
+    // price displayed anywhere; the conversion mode + multiplier + shift are
+    // enough to diagnose a mis-scaled paste.
+    table.cell(dbg, 0, 1, "图" + syminfo.ticker + (syminfo.root == syminfo.ticker ? "" : "(根" + syminfo.root + ")") + "·数据" + (gSym == "" ? "—" : gSym) + "·" + (gConvMode == "" ? "—" : gConvMode) + "×" + str.tostring(gConv, "#.####") + "·价差" + (gShift >= 0 ? "+" : "") + str.tostring(gShift, "#.##"), text_color = color.white, text_size = size.small, bgcolor = color.new(#1E222D, 10))
+    // Head of whatever string the input ACTUALLY holds — settles "is the
+    // right data even in the field?" from one screenshot.
+    table.cell(dbg, 0, 2, "串头 " + (dLen == 0 ? "（输入框为空）" : str.substring(srcText, 0, math.min(64, dLen))), text_color = color.new(#E8E6E1, 15), text_size = size.tiny, bgcolor = color.new(#1E222D, 30))
