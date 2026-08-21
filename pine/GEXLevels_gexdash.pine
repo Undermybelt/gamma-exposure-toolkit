@@ -30,7 +30,7 @@ indicator("GEX Levels — gexdash", overlay = true, max_lines_count = 500, max_l
 
 // ──────────────────────────────── INPUTS ────────────────────────────────
 const string TIP = "Paste the string from `python3 -m gextv.cli <SYMBOL>`. Format: M:key=value|L:price,label,kind;..."
-const string IND_VER = "v12"
+const string IND_VER = "v13"
 string srcText = input.text_area("", "GEX data string", group = "GEX Data", tooltip = TIP)
 string basisMode = input.string("自动（按现价识别）", "价位换算", group = "GEX Data", options =
      ["自动（按现价识别）", "手动（倍数+价差）", "关闭（原价）"], tooltip =
@@ -67,7 +67,7 @@ string labelSide   = input.string("自动错开", "标签位置", options = ["�
      "自动错开：所有标签先按价位排序，相邻两个价格差小于阈值时一上一下交替放置，避免文字重叠。\n"
      + "线上方/线下方：全部标签统一放线上方/下方。\n"
      + "线上居中：标签气泡中线对齐价位（旧默认样式）。")
-float  labelGapPct = input.float(0.05, "自动错开：相邻间距阈值（价格%）", minval = 0.001, maxval = 5.0, step = 0.01, group = "Style", tooltip = "相邻标签价格差小于当前价的此百分比时视为重叠，上下交替错开。数值越大越早错开。")
+float  labelGapPct = input.float(0.05, "自动错开：相邻间距阈值（价格%）", minval = 0.001, maxval = 5.0, step = 0.01, group = "Style", tooltip = "相邻标签价格差小于当前价的此百分比时视为重叠，上下交替错开；同时也是同侧标签强制保持的最小间距（同侧太近会向上顶开）。数值越大越早错开、间距越大。")
 int    hStepBars = input.int(3, "横向错开间距（K线）", minval = 0, maxval = 50, group = "Style", tooltip = "自动错开时，同一重叠组内第 n 个标签向右挪 n×此值的水平距离，纵向横向同时错开、依次排开。")
 string dbgPos   = input.string("Top left", "调试行位置", options = ["Top left", "Top right", "Bottom left", "Bottom right"], group = "Style")
 bool   showDebug  = input.bool(true,  "调试行（排查显示用）", group = "Style")
@@ -422,6 +422,13 @@ if barstate.islast and str.length(srcText) > 0
             float gapPx = close * labelGapPct / 100.0
             bool above = true
             float prevY = na
+            // Per-side placement trackers: the display y of the last label put
+            // on each side. Alternation alone cannot separate 3+ coincident
+            // labels — the 3rd flips back to the 1st's side and its bubble
+            // lands on the 1st's. Enforcing the gap against THIS side's last
+            // occupant makes same-side overlap impossible by construction.
+            float prevUpY = na
+            float prevDnY = na
             int runIdx = 0 // position within the current overlap run
             for i = 0 to nL - 1
                 float y = array.get(lblY, i)
@@ -429,6 +436,7 @@ if barstate.islast and str.length(srcText) > 0
                 color c = array.get(lblCol, i)
                 lstyle = label.style_label_left
                 int xOff = labelOff
+                float yDisp = y
                 if labelSide == "自动错开"
                     // Stagger on BOTH axes: inside an overlap run, labels
                     // alternate above/below AND step right by hStepBars each,
@@ -442,11 +450,28 @@ if barstate.islast and str.length(srcText) > 0
                     xOff += runIdx * hStepBars
                     lstyle := above ? label.style_label_up : label.style_label_down
                 else if labelSide == "线上方"
+                    above := true
                     lstyle := label.style_label_up
                 else if labelSide == "线下方"
+                    above := false
                     lstyle := label.style_label_down
+                // Same-side collision resolution (all modes except 线上居中,
+                // whose centered bubbles the user opted into). Up-bubbles grow
+                // upward from the anchor, down-bubbles downward — sorted
+                // ascending, a later same-side label must clear the previous
+                // one by gapPx, so nudge its anchor up to prevSide + gapPx.
+                // Carrying the trackers across runs is deliberate: a previous
+                // run's nudged label still occupies its bubble.
+                if labelSide != "线上居中"
+                    float ref = above ? prevUpY : prevDnY
+                    if not na(ref)
+                        yDisp := math.max(yDisp, ref + gapPx)
+                    if above
+                        prevUpY := yDisp
+                    else
+                        prevDnY := yDisp
                 prevY := y
-                array.push(lbs, label.new(bar_index + xOff, y, txt, style = lstyle, color = color.new(color.black, 100), textcolor = c, size = f_size(labelSize)))
+                array.push(lbs, label.new(bar_index + xOff, yDisp, txt, style = lstyle, color = color.new(color.black, 100), textcolor = c, size = f_size(labelSize)))
 
 // ─────────────────────────── LEGEND / ABBREVIATION PANEL ─────────────────
 // Surfaces (a) the snapshot status and (b) what every abbreviation means, so a

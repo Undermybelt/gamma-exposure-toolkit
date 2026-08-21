@@ -121,12 +121,12 @@ Open `pine/GEXLevels_gexdash.pine` in the TradingView Pine editor, add it to a c
 - toggle max pain, OI walls, expected move, IV bands,
 - convert levels into the chart's own price space (`价位换算`). **自动** resolves in a fixed order: same instrument as the data → raw prices (option strikes are absolute; a post-snapshot gap must not drag them); futures charts → symbol-pair table keyed on the data symbol × the chart's root (`syminfo.root`) with the exact contract scale plus an additive basis shift (NDX→NQ ×1, NDX→MNQ ×0.1, SPX→ES ×1, SPY→MES ×1, QQQ→NQ ×40); anything else → ratio conversion (chart close ÷ data spot, spread ≈ 0), which self-calibrates ETF↔index tracking drift. **手动** takes your own multiplier + spread and works even when the string has no parsable spot; **关闭** renders raw data prices. The debug row shows `图<symbol>·数据<sym>·<mode>×<mult>` so a mis-scaled paste is diagnosable from a screenshot.
 - show a legend/abbreviation panel in any of the four corners — it carries the snapshot status (live vs prior-close), the snapshot time in **UTC-4** together with the data's age (「分前 / 时前」， amber past 2 h), net gamma, IV/RV and a glossary of every short code. The whole board has a configurable background colour (`面板底色`) so it stays readable on any theme. Spot is intentionally not displayed anywhere on the chart.
-- stagger labels on **both axes**: near-adjacent labels alternate above/below the line *and* cascade right by `横向错开间距` bars each, so an overlap run reads as an ordered diagonal instead of a vertical stack,
+- stagger labels on **both axes** with per-side collision resolution: near-adjacent labels alternate above/below the line *and* cascade right by `横向错开间距` bars each; within one side, any label that would land on the previous same-side bubble is nudged up to keep the `相邻间距阈值` clearance — so 3+ coincident levels stay readable, not just pairs.
 - move the debug row to any corner (`调试行位置`) — it reports parse/conversion state without spot readouts.
 
 ## What this deliberately does *not* do
 
-- **No futures option chains.** gexdash serves index/ETF option chains, not futures chains — so the GEX itself is always computed from SPX/NDX/QQQ/SPY/IWM options. What the indicator *does* do is land those levels on a futures chart: the v12 pair table maps them onto ES/MES/NQ/MNQ at the exact contract scale with the live basis as the additive shift, so an NDX string reads correctly on an NQ or MNQ chart without any manual math.
+- **No futures option chains.** gexdash serves index/ETF option chains, not futures chains — so the GEX itself is always computed from SPX/NDX/QQQ/SPY/IWM options. What the indicator *does* do is land those levels on a futures chart: the pair table maps them onto ES/MES/NQ/MNQ at the exact contract scale with the live basis as the additive shift, so an NDX string reads correctly on an NQ or MNQ chart without any manual math.
 - **No fabricated confidence fields.** The TLADe-style "Hold: 80% | Break: 20%" probabilities some Pine scripts show are not in gexdash's data, so they are not emitted. A confidence number a trader can't audit is worse than none.
 - **No silent fallback on bad input.** gexdash returns HTTP 200 for arbitrary equity tickers (it has no symbol whitelist server-side), so a typo like `ES` would hand back Eversource Energy's chain. The client refuses unlisted symbols before any request, and refuses any payload whose returned symbol / expiry / spot don't match what was asked for.
 
@@ -136,7 +136,7 @@ Open `pine/GEXLevels_gexdash.pine` in the TradingView Pine editor, add it to a c
 python3 -m unittest tests.test_pipeline -v
 ```
 
-24 tests, all offline (synthetic payloads; no network). The `PineContractTest` suite re-implements the Pine parser's `f_baseKind`/`f_bucketOf` logic in Python and asserts every emitted kind round-trips — so renaming a kind suffix breaks the tests before it breaks the chart. `PineConversionContractTest` mirrors the v12 price-space conversion decision tree (pair table → ratio → raw) the same way.
+24 tests, all offline (synthetic payloads; no network). The `PineContractTest` suite re-implements the Pine parser's `f_baseKind`/`f_bucketOf` logic in Python and asserts every emitted kind round-trips — so renaming a kind suffix breaks the tests before it breaks the chart. `PineConversionContractTest` mirrors the price-space conversion decision tree (pair table → ratio → raw) the same way.
 
 ## License & data source
 
