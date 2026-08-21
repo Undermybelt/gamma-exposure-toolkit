@@ -92,23 +92,6 @@
   background: #1845cc;
 }
 
-/* secondary action (绑定输入框) — outline style */
-#gextv-bridge-panel .gextv-secondary {
-  width: 100%;
-  padding: 6px 10px;
-  background: transparent;
-  border: 1px solid #363a45;
-  border-radius: 4px;
-  color: #d1d4dc;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-#gextv-bridge-panel .gextv-secondary:hover {
-  border-color: #2962ff;
-  color: #fff;
-}
-
 #gextv-status {
   font-size: 11px;
   color: #787b86;
