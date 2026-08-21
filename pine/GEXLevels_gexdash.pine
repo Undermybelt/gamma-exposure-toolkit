@@ -30,12 +30,14 @@ indicator("GEX Levels — gexdash", overlay = true, max_lines_count = 500, max_l
 
 // ──────────────────────────────── INPUTS ────────────────────────────────
 const string TIP = "Paste the string from `python3 -m gextv.cli <SYMBOL>`. Format: M:key=value|L:price,label,kind;..."
+const string IND_VER = "v8"
 string srcText = input.text_area("", "GEX data string", group = "GEX Data", tooltip = TIP)
-bool basisShift = input.bool(true, "基差换算（贴到期货图时开启）", group = "GEX Data", tooltip =
-     "把字符串贴到非同品种图表时的加法平移：基差 = 图表现价 − 数据源spot，全部价位整体平移。\n"
-     + "适用：NDX字符串→NQ图、SPX字符串→ES图（指数↔期货）。\n"
-     + "贴在同品种图（NDX串贴NDX图）基差≈0，无影响。\n"
-     + "不适用于倍数关系的品种（SPY/SPX、QQQ/NDX）。")
+string basisMode = input.string("自动", "价位换算（贴到别的品种图时用）", group = "GEX Data", options =
+     ["自动", "关闭（原价）", "×10", "÷10（微合约/SPY）", "÷40（QQQ≈NDX，近似）"], tooltip =
+     "换算公式：图表价位 = 数据价位 × 倍数 + 基差，其中基差 = 图表现价 − 数据spot × 倍数。\n"
+     + "自动：按 图表现价 ÷ 数据spot 的比值识别倍数——比值≈1 走加法基差（NDX串→NQ图、SPX串→ES图）；"
+     + "≈0.1 走÷10（NDX串→MNQ图、SPX串→MES/SPY图）；≈0.025 走÷40（NDX串→QQQ图，倍率漂移，近似）。\n"
+     + "同品种图（NDX串贴NDX图）自动结果≈原价，无需干预。识别错了就手动指定倍数。")
 
 // Expiry bucket visibility — each bucket is one line style.
 bool sh0   = input.bool(true,  "0DTE",   group = "Expiry buckets", inline = "e")
@@ -157,8 +159,9 @@ f_visible(string base, string bucket) =>
 // surfaced in the legend panel and used to label the snapshot as live vs stale.
 var string gSym     = ""
 var string gSpot    = ""
-var float  gSpotF   = na  // numeric data-source spot, for the basis shift
-var float  gShift   = 0.0 // applied basis offset (chart price − data spot); global so the debug row can read it
+var float  gSpotF   = na  // numeric data-source spot, for the conversion
+var float  gConv    = 1.0 // multiplier: 1 index↔full futures, 0.1 micro/SPY, 0.025 QQQ≈NDX
+var float  gShift   = 0.0 // additive offset: chart price − gConv × data spot
 var string gState   = ""
 var string gBasis   = ""
 var string gAsof    = ""
@@ -236,13 +239,29 @@ if barstate.islast and str.length(srcText) > 0
             else if key == "oipc"
                 gOiPc := val
 
-    // Basis shift: additive conversion when the string's home symbol differs
-    // from the chart symbol (NDX string on an NQ chart, SPX on ES). basis =
-    // chart price now − data-source spot at snapshot time. On a same-symbol
-    // chart it collapses to ~0. Ratio-type pairs (SPY/SPX, QQQ/NDX) are NOT
-    // handled — turn the toggle off there. Stored in the gShift global so the
-    // debug row (a separate top-level block) can read it.
-    gShift := basisShift and not na(gSpotF) and gSpotF > 0 ? close - gSpotF : 0.0
+    // Price-space conversion so pasted levels land on THIS chart's vertical
+    // axis: chart_price = data_price × gConv + gShift. gConv is the contract /
+    // ratio multiplier (auto-snapped from close ÷ spot: ≈1 → index↔full-size
+    // futures, additive basis only; ≈0.1 → micro contracts or SPY; ≈0.025 →
+    // QQQ≈NDX, approximate). gShift = close − gConv × spot pins the snapshot's
+    // own spot onto the chart's current price, so on a same-symbol chart the
+    // conversion collapses to identity. Globals so the debug row (a separate
+    // top-level block) can read them.
+    bool canConvert = not na(gSpotF) and gSpotF > 0
+    if not canConvert or basisMode == "关闭（原价）"
+        gConv := 1.0
+        gShift := 0.0
+    else
+        float ratio = close / gSpotF
+        if basisMode == "×10"
+            gConv := 10.0
+        else if basisMode == "÷10（微合约/SPY）"
+            gConv := 0.1
+        else if basisMode == "÷40（QQQ≈NDX，近似）"
+            gConv := 0.025
+        else // 自动
+            gConv := ratio >= 9.0 and ratio <= 11.0 ? 10.0 : ratio >= 0.09 and ratio <= 0.11 ? 0.1 : ratio >= 0.022 and ratio <= 0.028 ? 0.025 : 1.0
+        gShift := close - gConv * gSpotF
 
     // One small label under the last bar summarising the snapshot — tells the
     // eye immediately whether the chart is live or carried-forward.
@@ -263,7 +282,7 @@ if barstate.islast and str.length(srcText) > 0
                 string lbl = array.get(f, 1)
                 string kind = array.get(f, 2)
                 if not na(p) and p > 0
-                    float y = p + gShift  // chart-space price after the basis shift
+                    float y = p * gConv + gShift  // this chart's price space
                     string base = f_baseKind(kind)
                     string bucket = f_bucketOf(kind)
                     if f_visible(base, bucket)
@@ -368,6 +387,6 @@ if showPanel and barstate.islast
 var table dbg = table.new(position.top_left, 1, 1)
 if showDebug and barstate.islast
     int dLen = str.length(srcText)
-    string dbgMsg = "数据 " + str.tostring(dLen) + " 字 · 行 " + str.tostring(dbgRows) + " · 画 " + str.tostring(dbgDrawn) + (gSym == "" ? "" : " · " + gSym) + (gShift == 0 ? "" : " · 基差" + (gShift > 0 ? "+" : "") + str.tostring(gShift, "#.#"))
+    string dbgMsg = IND_VER + " · 数据 " + str.tostring(dLen) + " 字 · 行 " + str.tostring(dbgRows) + " · 画 " + str.tostring(dbgDrawn) + (gSym == "" ? "" : " · " + gSym) + " · ×" + str.tostring(gConv, "#.###") + " 基差" + (gShift >= 0 ? "+" : "") + str.tostring(gShift, "#.#")
     color dbgBg = dLen == 0 ? color.new(#EF5350, 10) : dbgDrawn == 0 ? color.new(#F0B90B, 10) : color.new(#26A69A, 10)
     table.cell(dbg, 0, 0, dbgMsg, text_color = color.white, text_size = size.small, bgcolor = dbgBg)
