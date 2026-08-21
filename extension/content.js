@@ -1,10 +1,20 @@
 // content.js — injected into tradingview.com.
 //
-// Adds a small floating panel with a symbol picker + "Load GEX" button. On
-// click it asks the background worker for the level string and tries to find
-// the Pine indicator's data textarea to paste it into. If the textarea isn't
-// present (indicator not added, or settings not open), it falls back to
-// copying to the clipboard so the user can paste manually into the field.
+// Flow: pick symbol → 「加载并填入」 asks the background worker for the level
+// string, ALWAYS copies it to the clipboard (guaranteed fallback), then tries
+// to write it into the indicator's "GEX data string" textarea.
+//
+// Write target, in priority order:
+//   1. the textarea bound via 「绑定输入框」 pick mode — the user clicks the
+//      field once and we hold the reference for this page load. Robust against
+//      any TradingView DOM change, because the user, not a selector, chooses.
+//   2. heuristics: textarea whose attributes or nearby title text mention GEX
+//   3. the largest visible textarea (while the settings dialog is open it
+//      hosts the only large one)
+//
+// If every write misses, the clipboard copy has already succeeded — paste
+// manually. Note no fill is possible unless the indicator's settings dialog
+// is open; the status line says so when we cannot find a field.
 
 const DEFAULT_SYMBOL_KEY = "gextv:defaultSymbol";
 const POSITION_KEY = "gextv:panelPos"; // {x, y}
@@ -29,36 +39,7 @@ function loadState() {
 function savePos(pos) { chrome.storage.local.set({ [POSITION_KEY]: pos }); }
 function saveCollapsed(c) { chrome.storage.local.set({ [COLLAPSED_KEY]: c }); }
 
-// ── textarea lookup (unchanged) ───────────────────────────────────────────
-function findGexTextarea() {
-  const candidates = Array.from(document.querySelectorAll("textarea"));
-  for (const ta of candidates) {
-    const hay = `${ta.placeholder || ""} ${ta.getAttribute("aria-label") || ""} ${ta.name || ""}`;
-    if (/gex/i.test(hay)) return ta;
-  }
-  for (const ta of candidates) {
-    let row = ta.closest("div");
-    for (let i = 0; i < 6 && row; i++) {
-      const text = row.textContent || "";
-      if (/gex/i.test(text) && /string|data/i.test(text)) return ta;
-      row = row.parentElement;
-    }
-  }
-  const visible = candidates.filter(t => t.offsetParent !== null);
-  if (visible.length) {
-    return visible.reduce((a, b) => (a.cols * a.rows > b.cols * b.rows ? a : b));
-  }
-  return null;
-}
-
-function setNativeValue(el, value) {
-  const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
-  setter.call(el, value);
-  el.dispatchEvent(new Event("input", { bubbles: true }));
-  el.dispatchEvent(new Event("change", { bubbles: true }));
-}
-
+// ── clipboard ─────────────────────────────────────────────────────────────
 async function copyToClipboard(text) {
   try { await navigator.clipboard.writeText(text); return true; }
   catch {
@@ -75,35 +56,167 @@ async function copyToClipboard(text) {
   }
 }
 
+// ── textarea discovery ────────────────────────────────────────────────────
+function isVisible(el) {
+  if (!el.isConnected) return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+
+function boxArea(el) {
+  const r = el.getBoundingClientRect();
+  return r.width * r.height;
+}
+
+// querySelectorAll that also descends into shadow roots. Only used when the
+// plain lookups fail, so the O(all-elements) walk is rare.
+function deepQueryAll(selector) {
+  const out = [];
+  const walk = (root) => {
+    out.push(...root.querySelectorAll(selector));
+    for (const el of root.querySelectorAll("*")) {
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  };
+  walk(document);
+  return out;
+}
+
+function findGexTextarea() {
+  const tas = Array.from(document.querySelectorAll("textarea"));
+
+  // 1. Strongest signal: the field itself carries a GEX hint.
+  for (const ta of tas) {
+    const hay = `${ta.placeholder || ""} ${ta.getAttribute("aria-label") || ""} ${ta.name || ""} ${ta.id || ""}`;
+    if (/gex/i.test(hay)) return ta;
+  }
+
+  // 2. Nearby title text: TradingView renders the input title ("GEX data
+  //    string") as a sibling label inside a shared row container. Climb a few
+  //    ancestors and look for it; require the field to be visible so hidden
+  //    templates don't win.
+  for (const ta of tas) {
+    if (!isVisible(ta)) continue;
+    let row = ta.parentElement;
+    for (let i = 0; i < 8 && row && row !== document.body; i++) {
+      if (/gex/i.test(row.textContent || "")) return ta;
+      row = row.parentElement;
+    }
+  }
+
+  // 3. Last resort: the largest visible textarea. While the indicator settings
+  //    dialog is open it hosts the only multi-line field on the page.
+  const vis = tas.filter(isVisible);
+  if (vis.length) return vis.reduce((a, b) => (boxArea(b) > boxArea(a) ? b : a));
+
+  // 4. Everything above missed — maybe the dialog lives in a shadow root.
+  const deep = deepQueryAll("textarea").filter(isVisible);
+  if (deep.length) return deep.reduce((a, b) => (boxArea(b) > boxArea(a) ? b : a));
+
+  return null;
+}
+
+// ── writing the value ─────────────────────────────────────────────────────
+// TradingView's settings fields are framework-controlled. Assigning .value
+// directly often gets ignored or reverted. execCommand("insertText") goes
+// through the browser's real editing pipeline (beforeinput/input events, undo
+// stack), which every framework observes — it is the most reliable programmatic
+// "typing". Native setter + dispatched events remain as fallback, and we
+// verify the result either way.
+function setTextareaValue(ta, value) {
+  try {
+    ta.focus();
+    ta.setSelectionRange(0, ta.value.length);
+    let inserted = false;
+    try { inserted = document.execCommand("insertText", false, value); } catch {}
+    if (!inserted || ta.value !== value) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+      setter.call(ta, value);
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+      ta.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    ta.blur();
+    return ta.value === value;
+  } catch {
+    return false;
+  }
+}
+
+// ── pick mode: bind the target field by clicking it ───────────────────────
+let boundTarget = null; // element reference, valid until page reload
+let pickMode = false;
+
 function setStatus(text, color) {
   const el = document.getElementById("gextv-status");
   if (el) { el.textContent = text; el.style.color = color || "#787B86"; }
 }
 
+function onPickClick(e) {
+  if (e.target.closest && e.target.closest("#" + PANEL_ID)) {
+    exitPickMode();
+    setStatus("已取消绑定");
+    return;
+  }
+  const el = e.target.closest && e.target.closest("textarea, input[type='text'], input:not([type])");
+  if (el) {
+    boundTarget = el;
+    setStatus("已绑定目标输入框 ✓ 点「加载并填入」试试", "#26A69A");
+  } else {
+    setStatus("没点到输入框，已退出绑定模式", "#F0B90B");
+  }
+  exitPickMode();
+  // Do not preventDefault: let the click focus the field as usual.
+}
+
+function onPickKey(e) {
+  if (e.key === "Escape") {
+    exitPickMode();
+    setStatus("已取消绑定（Esc）");
+  }
+}
+
+function enterPickMode() {
+  if (pickMode) return;
+  pickMode = true;
+  setStatus("绑定模式：先打开指标设置，再点一下 GEX 数据输入框（Esc 取消）", "#3B82F6");
+  document.addEventListener("click", onPickClick, true);
+  document.addEventListener("keydown", onPickKey, true);
+}
+
+function exitPickMode() {
+  pickMode = false;
+  document.removeEventListener("click", onPickClick, true);
+  document.removeEventListener("keydown", onPickKey, true);
+}
+
+// ── load + fill ───────────────────────────────────────────────────────────
 async function onLoadClick(symbol) {
-  setStatus("Fetching gexdash…", "#3B82F6");
-  chrome.runtime.sendMessage({ type: "fetchGex", symbol }, (resp) => {
+  setStatus("正在从 gexdash 获取…", "#3B82F6");
+  chrome.runtime.sendMessage({ type: "fetchGex", symbol }, async (resp) => {
     if (chrome.runtime.lastError) {
-      setStatus("Extension error: " + chrome.runtime.lastError.message, "#EF5350");
+      setStatus("扩展错误: " + chrome.runtime.lastError.message, "#EF5350");
       return;
     }
     if (!resp || !resp.ok) {
-      setStatus(resp && resp.error ? "Error: " + resp.error : "Fetch failed", "#EF5350");
+      setStatus(resp && resp.error ? "错误: " + resp.error : "获取失败", "#EF5350");
       return;
     }
-    const str = resp.string;
-    const ta = findGexTextarea();
-    if (ta) {
-      setNativeValue(ta, str);
-      setStatus(`Filled ${resp.snapshot.symbol} (${resp.snapshot.basis})`, "#26A69A");
+
+    // Guaranteed fallback first: the string always lands in the clipboard,
+    // whatever happens to the auto-fill below.
+    const copied = await copyToClipboard(resp.string);
+
+    const ta =
+      (boundTarget && document.contains(boundTarget)) ? boundTarget : findGexTextarea();
+
+    if (ta && setTextareaValue(ta, resp.string)) {
+      setStatus(`✓ 已填入 ${resp.snapshot.symbol}（${resp.snapshot.basis}）· 也已复制 · 记得点 OK 保存`,
+        "#26A69A");
+    } else if (copied) {
+      setStatus("⚠ 未能自动写入 — 字符串已在剪贴板。打开指标设置后 Ctrl+V 粘贴；或点「绑定输入框」后重试",
+        "#F0B90B");
     } else {
-      const ok = copyToClipboard(str);
-      setStatus(
-        ok
-          ? `Copied ${resp.snapshot.symbol} (${resp.snapshot.basis}) — paste into the GEX data field`
-          : `Ready (${resp.snapshot.basis}) — could not auto-fill`,
-        ok ? "#26A69A" : "#F0B90B"
-      );
+      setStatus("✗ 自动复制也失败了，请在面板里手动操作", "#EF5350");
     }
   });
 }
@@ -124,9 +237,8 @@ function makeDraggable(panel, handle, applyPos) {
     let x = px + (e.clientX - sx);
     let y = py + (e.clientY - sy);
     const r = panel.getBoundingClientRect();
-    const w = r.width, h = r.height;
-    x = Math.min(Math.max(8, x), window.innerWidth - w - 8);
-    y = Math.min(Math.max(8, y), window.innerHeight - h - 8);
+    x = Math.min(Math.max(8, x), window.innerWidth - r.width - 8);
+    y = Math.min(Math.max(8, y), window.innerHeight - r.height - 8);
     panel.style.left = x + "px";
     panel.style.top = y + "px";
     panel.style.right = "auto";
@@ -142,6 +254,7 @@ function makeDraggable(panel, handle, applyPos) {
   document.addEventListener("pointerup", end);
 }
 
+// ── panel ─────────────────────────────────────────────────────────────────
 async function buildPanel() {
   if (document.getElementById(PANEL_ID)) return;
   const state = await loadState();
@@ -165,7 +278,7 @@ async function buildPanel() {
 
   const collapse = document.createElement("button");
   collapse.className = "gextv-collapse";
-  collapse.title = "Hide panel";
+  collapse.title = "收起面板";
   collapse.textContent = "—";
   header.appendChild(collapse);
   panel.appendChild(header);
@@ -185,30 +298,35 @@ async function buildPanel() {
   body.appendChild(select);
 
   const btn = document.createElement("button");
-  btn.textContent = "Load GEX → chart";
+  btn.textContent = "加载并填入";
   btn.id = "gextv-load";
   body.appendChild(btn);
 
+  const pick = document.createElement("button");
+  pick.textContent = "绑定输入框";
+  pick.className = "gextv-secondary";
+  pick.title = "手动指定要填写的输入框（推荐，一劳永逸）";
+  body.appendChild(pick);
+
   const status = document.createElement("div");
   status.id = "gextv-status";
-  status.textContent = "ready";
+  status.textContent = "就绪 — 用前先打开指标的设置(齿轮)";
   body.appendChild(status);
 
   panel.appendChild(body);
   document.body.appendChild(panel);
 
-  // Collapse: hide body, swap glyph, persist. When collapsed the panel is just
-  // the header bar — small footprint that can still be dragged and re-expanded.
   const applyCollapsed = (c) => {
     body.style.display = c ? "none" : "flex";
     collapse.textContent = c ? "+" : "—";
-    collapse.title = c ? "Show panel" : "Hide panel";
+    collapse.title = c ? "展开面板" : "收起面板";
     saveCollapsed(c);
   };
   applyCollapsed(state.collapsed);
   collapse.addEventListener("click", () => applyCollapsed(body.style.display === "none" ? false : true));
 
   btn.addEventListener("click", () => onLoadClick(select.value));
+  pick.addEventListener("click", enterPickMode);
   select.addEventListener("change", () => saveDefaultSymbol(select.value));
   loadDefaultSymbol().then(sym => { select.value = sym; });
 

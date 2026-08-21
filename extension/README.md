@@ -14,8 +14,19 @@ TradingView's Pine sandbox cannot reach `gexdash.com`, so the indicator still on
 ## Use
 
 1. Pick a symbol on the panel (SPX / NDX / QQQ / SPY / IWM / RUT).
-2. Open the indicator's settings (gear icon) so the **GEX data string** textarea is visible.
-3. Click **Load GEX → chart**. The panel turns green and the field fills; if the field was not found, the string is copied to the clipboard with a yellow hint to paste it manually.
+2. **Open the indicator's settings** (gear icon) so the **GEX data string** textarea exists on the page — no fill is possible while the dialog is closed.
+3. Click **加载并填入 (Load & fill)**. On success the field is written and the string is *also* copied to the clipboard; click **OK** in the settings dialog to save.
+4. If auto-fill misses, the string is already in your clipboard — just Ctrl/Cmd-V into the field. To stop relying on the DOM heuristics altogether, click **绑定输入框 (Bind field)**, then click the GEX data textarea once; the extension binds that exact element for this page load and fills it directly on every subsequent 「加载并填入」.
+
+### Why there are two fill paths
+
+TradingView renders its settings fields with obfuscated class names that change between releases, and the fields are framework-controlled — a plain `.value =` assignment is often ignored or reverted. The extension therefore:
+
+- writes through `document.execCommand("insertText")` (the browser's real editing pipeline, which framework-controlled inputs always observe), with a native-setter + dispatched `input`/`change` events as fallback, and verifies the field content afterwards;
+- prefers a **user-bound target** (pick mode) over any selector guess, so a TradingView DOM update can't silently break the fill;
+- always copies to the clipboard first, so the worst case is a manual paste, never a lost fetch.
+
+The heuristic lookup tries, in order: a textarea whose attributes mention "GEX"; a visible textarea whose surrounding row text mentions "GEX"; the largest visible textarea; the same search repeated through shadow roots. When it misses, bind the field once with 「绑定输入框」 and the heuristics no longer matter.
 
 ## How it works
 
