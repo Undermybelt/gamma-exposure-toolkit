@@ -15,11 +15,28 @@
 // If every write misses, the clipboard copy has already succeeded — paste
 // manually. Note no fill is possible unless the indicator's settings dialog
 // is open; the status line says so when we cannot find a field.
+//
+// EVENT ISOLATION: TradingView closes its settings dialog whenever a
+// pointer/keyboard event originates outside the dialog. Our floating panel is
+// outside it, so every panel click used to close the dialog before a fill
+// could run. panelGuard() below intercepts panel-originated events at the
+// window capture phase — before any TradingView handler can see them — and
+// routes the panel's own actions by delegation (stopping propagation at window
+// also prevents the panel's own element-level listeners from firing, so
+// delegation in the guard is the only way to handle them).
 
 const DEFAULT_SYMBOL_KEY = "gextv:defaultSymbol";
 const POSITION_KEY = "gextv:panelPos"; // {x, y}
 const COLLAPSED_KEY = "gextv:panelCollapsed";
 const PANEL_ID = "gextv-bridge-panel";
+
+// Module state shared by the guard and the UI.
+let panelEl = null;
+let currentSymbol = "QQQ";
+let toggleCollapse = null;
+let drag = null;
+let boundTarget = null; // element reference, valid until page reload
+let pickMode = false;
 
 // ── persistence helpers ───────────────────────────────────────────────────
 function loadDefaultSymbol() {
@@ -27,6 +44,7 @@ function loadDefaultSymbol() {
     resolve(r[DEFAULT_SYMBOL_KEY] || "QQQ")));
 }
 function saveDefaultSymbol(sym) {
+  currentSymbol = sym;
   chrome.storage.local.set({ [DEFAULT_SYMBOL_KEY]: sym });
 }
 function loadState() {
@@ -143,24 +161,16 @@ function setTextareaValue(ta, value) {
 }
 
 // ── pick mode: bind the target field by clicking it ───────────────────────
-let boundTarget = null; // element reference, valid until page reload
-let pickMode = false;
-
 function setStatus(text, color) {
   const el = document.getElementById("gextv-status");
   if (el) { el.textContent = text; el.style.color = color || "#787B86"; }
 }
 
 function onPickClick(e) {
-  if (e.target.closest && e.target.closest("#" + PANEL_ID)) {
-    exitPickMode();
-    setStatus("已取消绑定");
-    return;
-  }
   const el = e.target.closest && e.target.closest("textarea, input[type='text'], input:not([type])");
   if (el) {
     boundTarget = el;
-    setStatus("已绑定目标输入框 ✓ 点「加载并填入」试试", "#26A69A");
+    setStatus("已绑定目标输入框 ✓ 打开设置后点「加载并填入」", "#26A69A");
   } else {
     setStatus("没点到输入框，已退出绑定模式", "#F0B90B");
   }
@@ -221,38 +231,75 @@ async function onLoadClick(symbol) {
   });
 }
 
-// ── drag handler (pointer events, clamped to the viewport) ────────────────
-function makeDraggable(panel, handle, applyPos) {
-  let dragging = false, sx = 0, sy = 0, px = 0, py = 0;
-  const start = (e) => {
-    if (e.target.closest("button, select")) return; // don't drag from controls
-    dragging = true;
-    const r = panel.getBoundingClientRect();
-    px = r.left; py = r.top;
-    sx = e.clientX; sy = e.clientY;
-    e.preventDefault();
-  };
-  const move = (e) => {
-    if (!dragging) return;
-    let x = px + (e.clientX - sx);
-    let y = py + (e.clientY - sy);
-    const r = panel.getBoundingClientRect();
-    x = Math.min(Math.max(8, x), window.innerWidth - r.width - 8);
-    y = Math.min(Math.max(8, y), window.innerHeight - r.height - 8);
-    panel.style.left = x + "px";
-    panel.style.top = y + "px";
-    panel.style.right = "auto";
-  };
-  const end = () => {
-    if (!dragging) return;
-    dragging = false;
-    const r = panel.getBoundingClientRect();
-    applyPos({ x: r.left, y: r.top });
-  };
-  handle.addEventListener("pointerdown", start);
-  document.addEventListener("pointermove", move);
-  document.addEventListener("pointerup", end);
+// ── drag (module-level; started from the guard, moved/ended on document) ──
+function startDrag(e) {
+  if (!panelEl) return;
+  const r = panelEl.getBoundingClientRect();
+  drag = { sx: e.clientX, sy: e.clientY, px: r.left, py: r.top };
+  e.preventDefault(); // no text selection while dragging
 }
+function onDragMove(e) {
+  if (!drag || !panelEl) return;
+  let x = drag.px + (e.clientX - drag.sx);
+  let y = drag.py + (e.clientY - drag.sy);
+  const r = panelEl.getBoundingClientRect();
+  x = Math.min(Math.max(8, x), window.innerWidth - r.width - 8);
+  y = Math.min(Math.max(8, y), window.innerHeight - r.height - 8);
+  panelEl.style.left = x + "px";
+  panelEl.style.top = y + "px";
+  panelEl.style.right = "auto";
+}
+function onDragEnd() {
+  if (!drag || !panelEl) return;
+  drag = null;
+  const r = panelEl.getBoundingClientRect();
+  savePos({ x: r.left, y: r.top });
+}
+document.addEventListener("pointermove", onDragMove);
+document.addEventListener("pointerup", onDragEnd);
+
+// ── EVENT ISOLATION GUARD ─────────────────────────────────────────────────
+// Runs on window capture — the first possible interception point, ahead of
+// every TradingView listener on document or below. Panel-originated events are
+// stopped (so TradingView never interprets them as "clicked outside the
+// dialog") and the panel's actions are dispatched here by delegation.
+const GUARDED_EVENTS = [
+  "pointerdown", "mousedown", "click", "touchstart",
+  "contextmenu", "keydown", "keypress", "keyup",
+];
+
+function panelGuard(e) {
+  const t = e.target;
+  if (!t || !t.closest || !panelEl) return;
+  if (!t.closest("#" + PANEL_ID)) return;
+
+  // Blind TradingView (and anything else) to this event.
+  e.stopPropagation();
+  e.stopImmediatePropagation();
+
+  // Keep focus inside the TradingView dialog: preventDefault on pointerdown
+  // stops the browser from moving focus to our controls. Clicks still fire.
+  // Exception: the <select> needs its native default to open the dropdown.
+  if ((e.type === "pointerdown" || e.type === "mousedown") && !t.closest("select")) {
+    e.preventDefault();
+  }
+
+  if (e.type === "click") {
+    if (pickMode) { // clicking our panel during pick mode = cancel
+      exitPickMode();
+      setStatus("已取消绑定");
+    } else if (t.closest("#gextv-load")) {
+      onLoadClick(currentSymbol);
+    } else if (t.closest(".gextv-secondary")) {
+      enterPickMode();
+    } else if (t.closest(".gextv-collapse") && toggleCollapse) {
+      toggleCollapse();
+    }
+  } else if (e.type === "pointerdown") {
+    if (!t.closest("button, select") && t.closest(".gextv-header")) startDrag(e);
+  }
+}
+GUARDED_EVENTS.forEach(type => window.addEventListener(type, panelGuard, true));
 
 // ── panel ─────────────────────────────────────────────────────────────────
 async function buildPanel() {
@@ -261,6 +308,7 @@ async function buildPanel() {
 
   const panel = document.createElement("div");
   panel.id = PANEL_ID;
+  panelEl = panel;
   if (state.pos) {
     panel.style.left = state.pos.x + "px";
     panel.style.top = state.pos.y + "px";
@@ -316,21 +364,21 @@ async function buildPanel() {
   panel.appendChild(body);
   document.body.appendChild(panel);
 
-  const applyCollapsed = (c) => {
-    body.style.display = c ? "none" : "flex";
-    collapse.textContent = c ? "+" : "—";
-    collapse.title = c ? "展开面板" : "收起面板";
-    saveCollapsed(c);
+  toggleCollapse = () => {
+    const show = body.style.display === "none";
+    body.style.display = show ? "flex" : "none";
+    collapse.textContent = show ? "—" : "+";
+    collapse.title = show ? "收起面板" : "展开面板";
+    saveCollapsed(!show);
   };
-  applyCollapsed(state.collapsed);
-  collapse.addEventListener("click", () => applyCollapsed(body.style.display === "none" ? false : true));
+  if (state.collapsed) {
+    body.style.display = "none";
+    collapse.textContent = "+";
+  }
 
-  btn.addEventListener("click", () => onLoadClick(select.value));
-  pick.addEventListener("click", enterPickMode);
+  // 'change' is not a guarded event, so a plain listener works for the select.
   select.addEventListener("change", () => saveDefaultSymbol(select.value));
-  loadDefaultSymbol().then(sym => { select.value = sym; });
-
-  makeDraggable(panel, header, savePos);
+  loadDefaultSymbol().then(sym => { select.value = sym; currentSymbol = sym; });
 }
 
 let installed = false;
