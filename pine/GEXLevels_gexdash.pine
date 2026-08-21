@@ -160,35 +160,10 @@ var string gIV      = ""
 var string gRV      = ""
 var string gOiPc    = ""
 
-f_meta(string header) =>
-    // header looks like "M:sym=QQQ,spot=716.08,..."
-    string h = str.startswith(header, "M:") ? str.substring(header, 2) : header
-    array<string> pairs = str.split(h, ",")
-    for pair in pairs
-        array<string> kv = str.split(pair, "=")
-        if array.size(kv) == 2
-            string key = array.get(kv, 0)
-            string val = array.get(kv, 1)
-            if key == "sym"
-                gSym := val
-            else if key == "spot"
-                gSpot := val
-            else if key == "state"
-                gState := val
-            else if key == "basis"
-                gBasis := val
-            else if key == "asof"
-                gAsof := val
-            else if key == "src"
-                gSrc := val
-            else if key == "ng"
-                gNetGex := val
-            else if key == "iv"
-                gIV := val
-            else if key == "rv"
-                gRV := val
-            else if key == "oipc"
-                gOiPc := val
+// The M: header is parsed inline in the main scope below, not in a function:
+// Pine v6 (CE10088) forbids mutating var globals from inside a function, and
+// every parsed field writes to one of the g* globals above.
+
 
 // ───────────────────────────── DRAW STATE ───────────────────────────────
 var array<line>  lns = array.new<line>()
@@ -219,7 +194,35 @@ if barstate.islast and str.length(srcText) > 0
     else
         levelStr := srcText
 
-    f_meta(header)
+    // Parse the M: header inline (CE10088: var globals cannot be written from
+    // a function, so this cannot live in a helper). Same key=value split.
+    string h = str.startswith(header, "M:") ? str.substring(header, 2) : header
+    array<string> pairs = str.split(h, ",")
+    for pair in pairs
+        array<string> kv = str.split(pair, "=")
+        if array.size(kv) == 2
+            string key = array.get(kv, 0)
+            string val = array.get(kv, 1)
+            if key == "sym"
+                gSym := val
+            else if key == "spot"
+                gSpot := val
+            else if key == "state"
+                gState := val
+            else if key == "basis"
+                gBasis := val
+            else if key == "asof"
+                gAsof := val
+            else if key == "src"
+                gSrc := val
+            else if key == "ng"
+                gNetGex := val
+            else if key == "iv"
+                gIV := val
+            else if key == "rv"
+                gRV := val
+            else if key == "oipc"
+                gOiPc := val
 
     // One small label under the last bar summarising the snapshot — tells the
     // eye immediately whether the chart is live or carried-forward.
@@ -277,7 +280,9 @@ if showPanel and barstate.islast
         lastPos := panelPos
         panel := table.new(f_panelPos(), 2, 18, border_width = 0)
 
-    int pSz = panelSize == "Tiny" ? size.tiny : panelSize == "Small" ? size.small : size.normal
+    // size.* constants are a distinct type, not int — leave pSz untyped so Pine
+    // infers it from the ternary (CE10173 if declared `int`).
+    pSz = panelSize == "Tiny" ? size.tiny : panelSize == "Small" ? size.small : size.normal
     int r = 0
 
     // Header row: symbol + snapshot basis (live / prior-close).
