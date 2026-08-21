@@ -49,6 +49,7 @@ int    lineWidth  = input.int(1, "Line width", minval = 1, maxval = 4, group = "
 int    labelOff   = input.int(8, "Label offset (bars)", minval = 0, maxval = 200, group = "Style")
 bool   showPrice  = input.bool(true, "Show price in label", group = "Style")
 string labelSize  = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = "Style")
+bool   showDebug  = input.bool(true,  "调试行（排查显示用）", group = "Style")
 
 // Expiry bucket line styles (0DTE solid, Weekly dashed, Monthly dotted, All thick)
 string s0 = input.string("Solid",   "0DTE style",   options = ["Solid", "Dashed", "Dotted"], group = "Bucket styles", inline = "bs0")
@@ -169,6 +170,9 @@ var string gOiPc    = ""
 var array<line>  lns = array.new<line>()
 var array<label> lbs = array.new<label>()
 var label headerLabel = na
+// Debug counters for the on-chart troubleshooting row.
+var int dbgRows  = 0
+var int dbgDrawn = 0
 
 // ─────────────────────────────── PARSE + DRAW ───────────────────────────
 if barstate.islast and str.length(srcText) > 0
@@ -231,8 +235,11 @@ if barstate.islast and str.length(srcText) > 0
         headerLabel := label.new(bar_index + labelOff, low - ta.tr, stamp, style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.new(#787B86, 0), size = size.tiny)
 
     // Parse "price,label,kind;price,label,kind;..."
+    dbgRows := 0
+    dbgDrawn := 0
     if levelStr != ""
         array<string> rows = str.split(levelStr, ";")
+        dbgRows := array.size(rows)
         for row in rows
             array<string> f = str.split(row, ",")
             if array.size(f) == 3
@@ -253,6 +260,7 @@ if barstate.islast and str.length(srcText) > 0
                         // first so the per-expiry lines sit on top of it.
                         int useW = bucket == "all" ? math.max(wid, 2) : wid
                         array.push(lns, line.new(bar_index - 1, p, bar_index, p, extend = extend.both, color = c, width = useW, style = st))
+                        dbgDrawn += 1
                         if labelOff >= 0
                             string txt = showPrice ? lbl + "  " + str.tostring(p, format.mintick) : lbl
                             array.push(lbs, label.new(bar_index + labelOff, p, txt, style = label.style_label_left, color = color.new(color.black, 100), textcolor = c, size = f_size(labelSize)))
@@ -334,3 +342,15 @@ if showPanel and barstate.islast
     r += 1
     table.cell(panel, 0, r, "All-exp", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
     table.cell(panel, 1, r, sA + " w" + str.tostring(wA), text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+
+// ─────────────────────────────── DEBUG ROW ───────────────────────────────
+// Instruments the parse pipeline so a silent no-render is diagnosable from a
+// screenshot: 数据 0 → the paste never committed to the input; 行>0 画 0 →
+// every level was filtered out; 画>0 but nothing on the chart → the chart
+// symbol's price scale doesn't cover the levels (wrong symbol family).
+var table dbg = table.new(position.top_left, 1, 1)
+if showDebug and barstate.islast
+    int dLen = str.length(srcText)
+    string dbgMsg = "数据 " + str.tostring(dLen) + " 字 · 行 " + str.tostring(dbgRows) + " · 画 " + str.tostring(dbgDrawn) + (gSym == "" ? "" : " · " + gSym)
+    color dbgBg = dLen == 0 ? color.new(#EF5350, 10) : dbgDrawn == 0 ? color.new(#F0B90B, 10) : color.new(#26A69A, 10)
+    table.cell(dbg, 0, 0, dbgMsg, text_color = color.white, text_size = size.small, bgcolor = dbgBg)

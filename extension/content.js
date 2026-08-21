@@ -28,6 +28,7 @@
 const DEFAULT_SYMBOL_KEY = "gextv:defaultSymbol";
 const POSITION_KEY = "gextv:panelPos"; // {x, y}
 const COLLAPSED_KEY = "gextv:panelCollapsed";
+const POLL_KEY = "gextv:pollMin";      // 0 = off, else minutes
 const PANEL_ID = "gextv-bridge-panel";
 
 // Module state shared by the guard and the UI.
@@ -37,6 +38,8 @@ let toggleCollapse = null;
 let drag = null;
 let boundTarget = null; // element reference, valid until page reload
 let pickMode = false;
+let pollTimer = null;
+let pollBusy = false;
 
 // ── persistence helpers ───────────────────────────────────────────────────
 function loadDefaultSymbol() {
@@ -200,35 +203,59 @@ function exitPickMode() {
 }
 
 // ── load + fill ───────────────────────────────────────────────────────────
-async function onLoadClick(symbol) {
-  setStatus("正在从 gexdash 获取…", "#3B82F6");
-  chrome.runtime.sendMessage({ type: "fetchGex", symbol }, async (resp) => {
-    if (chrome.runtime.lastError) {
-      setStatus("扩展错误: " + chrome.runtime.lastError.message, "#EF5350");
-      return;
-    }
-    if (!resp || !resp.ok) {
-      setStatus(resp && resp.error ? "错误: " + resp.error : "获取失败", "#EF5350");
-      return;
-    }
+async function doFetchAndFill(prefix) {
+  if (pollBusy) return;
+  pollBusy = true;
+  setStatus(prefix + "正在从 gexdash 获取…", "#3B82F6");
+  chrome.runtime.sendMessage({ type: "fetchGex", symbol: currentSymbol }, async (resp) => {
+    try {
+      if (chrome.runtime.lastError) {
+        setStatus(prefix + "扩展错误: " + chrome.runtime.lastError.message, "#EF5350");
+        return;
+      }
+      if (!resp || !resp.ok) {
+        setStatus(prefix + (resp && resp.error ? "错误: " + resp.error : "获取失败"), "#EF5350");
+        return;
+      }
 
-    // Guaranteed fallback first: the string always lands in the clipboard,
-    // whatever happens to the auto-fill below.
-    const copied = await copyToClipboard(resp.string);
+      // Guaranteed fallback first: the string always lands in the clipboard,
+      // whatever happens to the auto-fill below.
+      const copied = await copyToClipboard(resp.string);
 
-    const ta =
-      (boundTarget && document.contains(boundTarget)) ? boundTarget : findGexTextarea();
+      const ta =
+        (boundTarget && document.contains(boundTarget)) ? boundTarget : findGexTextarea();
 
-    if (ta && setTextareaValue(ta, resp.string)) {
-      setStatus(`✓ 已填入 ${resp.snapshot.symbol}（${resp.snapshot.basis}）· 也已复制 · 记得点 OK 保存`,
-        "#26A69A");
-    } else if (copied) {
-      setStatus("⚠ 未能自动写入 — 字符串已在剪贴板。打开指标设置后 Ctrl+V 粘贴；或点「绑定输入框」后重试",
-        "#F0B90B");
-    } else {
-      setStatus("✗ 自动复制也失败了，请在面板里手动操作", "#EF5350");
+      const hh = new Date().toTimeString().slice(0, 5);
+      if (ta && setTextareaValue(ta, resp.string)) {
+        setStatus(`✓ ${hh} 已填入 ${resp.snapshot.symbol}（${resp.snapshot.basis}）· 记得点 OK 保存`,
+          "#26A69A");
+      } else if (copied) {
+        setStatus(`⚠ ${hh} 未能自动写入 — 已复制到剪贴板，Ctrl+V 粘贴`, "#F0B90B");
+      } else {
+        setStatus("✗ 自动复制也失败了", "#EF5350");
+      }
+    } finally {
+      pollBusy = false;
     }
   });
+}
+
+function onLoadClick() {
+  return doFetchAndFill("");
+}
+
+// ── auto-poll ─────────────────────────────────────────────────────────────
+// Re-fetches on an interval and refreshes both the clipboard and the bound
+// field. Note the honest limits: writing only lands while a settings dialog
+// with the field is open; the clipboard is always fresh regardless. The
+// dialog's OK button is never clicked automatically.
+function applyPoll(min) {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (min > 0) {
+    pollTimer = setInterval(() => doFetchAndFill("[自动] "), min * 60000);
+    doFetchAndFill("[自动] ");
+    setStatus(`自动刷新已开启：每 ${min} 分钟（写入需设置框开着；剪贴板始终更新）`, "#3B82F6");
+  }
 }
 
 // ── drag (module-level; started from the guard, moved/ended on document) ──
@@ -289,7 +316,7 @@ function panelGuard(e) {
       exitPickMode();
       setStatus("已取消绑定");
     } else if (t.closest("#gextv-load")) {
-      onLoadClick(currentSymbol);
+      onLoadClick();
     } else if (t.closest(".gextv-secondary")) {
       enterPickMode();
     } else if (t.closest(".gextv-collapse") && toggleCollapse) {
@@ -356,6 +383,17 @@ async function buildPanel() {
   pick.title = "手动指定要填写的输入框（推荐，一劳永逸）";
   body.appendChild(pick);
 
+  // Auto-poll interval picker.
+  const poll = document.createElement("select");
+  poll.title = "自动刷新：定时拉新数据并写入（写入需设置框开着；剪贴板始终更新）";
+  for (const [val, label] of [["0", "自动刷新：关"], ["1", "自动刷新：每1分钟"], ["5", "自动刷新：每5分钟"], ["15", "自动刷新：每15分钟"]]) {
+    const opt = document.createElement("option");
+    opt.value = val;
+    opt.textContent = label;
+    poll.appendChild(opt);
+  }
+  body.appendChild(poll);
+
   const status = document.createElement("div");
   status.id = "gextv-status";
   status.textContent = "就绪 — 用前先打开指标的设置(齿轮)";
@@ -376,9 +414,19 @@ async function buildPanel() {
     collapse.textContent = "+";
   }
 
-  // 'change' is not a guarded event, so a plain listener works for the select.
+  // 'change' is not a guarded event, so plain listeners work for the selects.
   select.addEventListener("change", () => saveDefaultSymbol(select.value));
+  poll.addEventListener("change", () => {
+    const min = parseInt(poll.value, 10) || 0;
+    chrome.storage.local.set({ [POLL_KEY]: min });
+    applyPoll(min);
+  });
   loadDefaultSymbol().then(sym => { select.value = sym; currentSymbol = sym; });
+  chrome.storage.local.get(POLL_KEY, r => {
+    const min = r[POLL_KEY] || 0;
+    poll.value = String(min);
+    if (min > 0) applyPoll(min);
+  });
 }
 
 let installed = false;
