@@ -7,32 +7,35 @@
 // copying to the clipboard so the user can paste manually into the field.
 
 const DEFAULT_SYMBOL_KEY = "gextv:defaultSymbol";
+const POSITION_KEY = "gextv:panelPos"; // {x, y}
+const COLLAPSED_KEY = "gextv:panelCollapsed";
 const PANEL_ID = "gextv-bridge-panel";
 
+// ── persistence helpers ───────────────────────────────────────────────────
 function loadDefaultSymbol() {
   return new Promise(resolve => chrome.storage.local.get(DEFAULT_SYMBOL_KEY, r =>
     resolve(r[DEFAULT_SYMBOL_KEY] || "QQQ")));
 }
-
 function saveDefaultSymbol(sym) {
   chrome.storage.local.set({ [DEFAULT_SYMBOL_KEY]: sym });
 }
+function loadState() {
+  return new Promise(resolve => chrome.storage.local.get(
+    [POSITION_KEY, COLLAPSED_KEY], r => resolve({
+      pos: r[POSITION_KEY] || null,
+      collapsed: r[COLLAPSED_KEY] || false,
+    })));
+}
+function savePos(pos) { chrome.storage.local.set({ [POSITION_KEY]: pos }); }
+function saveCollapsed(c) { chrome.storage.local.set({ [COLLAPSED_KEY]: c }); }
 
-// The Pine indicator's "GEX data string" input is a textarea. TradingView's
-// settings panel renders these as <textarea> elements, but it is buried inside
-// a shadow/scoped DOM and has no stable id. We look for a textarea whose data
-// attribute or nearby label text mentions "GEX", and as a last resort any
-// textarea in a visible settings dialog. This is the inherently fragile part —
-// it must track TradingView's DOM, which changes. When it breaks, the
-// clipboard fallback still carries the user.
+// ── textarea lookup (unchanged) ───────────────────────────────────────────
 function findGexTextarea() {
   const candidates = Array.from(document.querySelectorAll("textarea"));
-  // 1. explicit match on the data area's tooltip/placeholder/label text.
   for (const ta of candidates) {
     const hay = `${ta.placeholder || ""} ${ta.getAttribute("aria-label") || ""} ${ta.name || ""}`;
     if (/gex/i.test(hay)) return ta;
   }
-  // 2. walk up to the settings row and check its label text.
   for (const ta of candidates) {
     let row = ta.closest("div");
     for (let i = 0; i < 6 && row; i++) {
@@ -41,8 +44,6 @@ function findGexTextarea() {
       row = row.parentElement;
     }
   }
-  // 3. last resort: the largest textarea in a visible dialog (the data-area
-  //    input is always multi-line and the biggest one on the panel).
   const visible = candidates.filter(t => t.offsetParent !== null);
   if (visible.length) {
     return visible.reduce((a, b) => (a.cols * a.rows > b.cols * b.rows ? a : b));
@@ -51,9 +52,6 @@ function findGexTextarea() {
 }
 
 function setNativeValue(el, value) {
-  // TradingView uses React; a plain `.value =` won't trigger React's onChange.
-  // We set the value through the native input setter and dispatch an input
-  // event so React's synthetic handler picks it up.
   const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
   setter.call(el, value);
@@ -62,11 +60,8 @@ function setNativeValue(el, value) {
 }
 
 async function copyToClipboard(text) {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    // clipboard API can be blocked on non-focused frames; fall back to execCommand.
+  try { await navigator.clipboard.writeText(text); return true; }
+  catch {
     const ta = document.createElement("textarea");
     ta.value = text;
     ta.style.position = "fixed";
@@ -113,10 +108,72 @@ async function onLoadClick(symbol) {
   });
 }
 
-function buildPanel() {
+// ── drag handler (pointer events, clamped to the viewport) ────────────────
+function makeDraggable(panel, handle, applyPos) {
+  let dragging = false, sx = 0, sy = 0, px = 0, py = 0;
+  const start = (e) => {
+    if (e.target.closest("button, select")) return; // don't drag from controls
+    dragging = true;
+    const r = panel.getBoundingClientRect();
+    px = r.left; py = r.top;
+    sx = e.clientX; sy = e.clientY;
+    e.preventDefault();
+  };
+  const move = (e) => {
+    if (!dragging) return;
+    let x = px + (e.clientX - sx);
+    let y = py + (e.clientY - sy);
+    const r = panel.getBoundingClientRect();
+    const w = r.width, h = r.height;
+    x = Math.min(Math.max(8, x), window.innerWidth - w - 8);
+    y = Math.min(Math.max(8, y), window.innerHeight - h - 8);
+    panel.style.left = x + "px";
+    panel.style.top = y + "px";
+    panel.style.right = "auto";
+  };
+  const end = () => {
+    if (!dragging) return;
+    dragging = false;
+    const r = panel.getBoundingClientRect();
+    applyPos({ x: r.left, y: r.top });
+  };
+  handle.addEventListener("pointerdown", start);
+  document.addEventListener("pointermove", move);
+  document.addEventListener("pointerup", end);
+}
+
+async function buildPanel() {
   if (document.getElementById(PANEL_ID)) return;
+  const state = await loadState();
+
   const panel = document.createElement("div");
   panel.id = PANEL_ID;
+  if (state.pos) {
+    panel.style.left = state.pos.x + "px";
+    panel.style.top = state.pos.y + "px";
+    panel.style.right = "auto";
+  }
+
+  // Header row = drag handle + collapse toggle.
+  const header = document.createElement("div");
+  header.className = "gextv-header";
+
+  const title = document.createElement("span");
+  title.className = "gextv-title";
+  title.textContent = "GEXdash bridge";
+  header.appendChild(title);
+
+  const collapse = document.createElement("button");
+  collapse.className = "gextv-collapse";
+  collapse.title = "Hide panel";
+  collapse.textContent = "—";
+  header.appendChild(collapse);
+  panel.appendChild(header);
+
+  // Body (collapsible).
+  const body = document.createElement("div");
+  body.className = "gextv-body";
+  if (state.collapsed) body.style.display = "none";
 
   const select = document.createElement("select");
   for (const sym of ["SPX", "NDX", "QQQ", "SPY", "IWM", "RUT"]) {
@@ -125,28 +182,39 @@ function buildPanel() {
     opt.textContent = sym;
     select.appendChild(opt);
   }
-  panel.appendChild(select);
+  body.appendChild(select);
 
   const btn = document.createElement("button");
   btn.textContent = "Load GEX → chart";
   btn.id = "gextv-load";
-  panel.appendChild(btn);
+  body.appendChild(btn);
 
   const status = document.createElement("div");
   status.id = "gextv-status";
   status.textContent = "ready";
-  panel.appendChild(status);
+  body.appendChild(status);
+
+  panel.appendChild(body);
+  document.body.appendChild(panel);
+
+  // Collapse: hide body, swap glyph, persist. When collapsed the panel is just
+  // the header bar — small footprint that can still be dragged and re-expanded.
+  const applyCollapsed = (c) => {
+    body.style.display = c ? "none" : "flex";
+    collapse.textContent = c ? "+" : "—";
+    collapse.title = c ? "Show panel" : "Hide panel";
+    saveCollapsed(c);
+  };
+  applyCollapsed(state.collapsed);
+  collapse.addEventListener("click", () => applyCollapsed(body.style.display === "none" ? false : true));
 
   btn.addEventListener("click", () => onLoadClick(select.value));
   select.addEventListener("change", () => saveDefaultSymbol(select.value));
-
   loadDefaultSymbol().then(sym => { select.value = sym; });
-  document.body.appendChild(panel);
+
+  makeDraggable(panel, header, savePos);
 }
 
-// TradingView is an SPA; (re)inject the panel when the page settles. A
-// MutationObserver is overkill and noisy; a debounced re-check on pushState
-// is enough.
 let installed = false;
 function tryInstall() {
   if (installed || !document.body) return;

@@ -116,10 +116,16 @@ f_color(string base) =>
      : color.new(#7A7A85, 30)
 
 f_bucketStyle(string bucket) =>
-    bucket == "0dte"   ? [f_lineStyle(s0), w0]
-     : bucket == "weekly"  ? [f_lineStyle(sW), wW]
-     : bucket == "monthly" ? [f_lineStyle(sM), wM]
-     : [f_lineStyle(sA), wA]  // "all"
+    // Pine ternaries cannot return tuples (CE10163); if/else branches each
+    // yield a [style, width] tuple for the caller to unpack.
+    if bucket == "0dte"
+        [f_lineStyle(s0), w0]
+    else if bucket == "weekly"
+        [f_lineStyle(sW), wW]
+    else if bucket == "monthly"
+        [f_lineStyle(sM), wM]
+    else
+        [f_lineStyle(sA), wA]
 
 // Is a kind visible given the current settings?
 f_visible(string base, string bucket) =>
