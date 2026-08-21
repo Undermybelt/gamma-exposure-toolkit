@@ -1,0 +1,320 @@
+//@version=6
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  GEX Levels — gexdash.com source                                             ║
+// ║                                                                              ║
+// ║  Plots dealer gamma exposure levels for SPX / NDX / QQQ / SPY / IWM from the  ║
+// ║  gexdash.com public API (Schwab option-chain data). One string, pasted into  ║
+// ║  the GEX Data field, carries four expiry buckets at once: 0DTE / Weekly /   ║
+// ║  Monthly / All. Generate it with the companion CLI:                          ║
+// ║      python3 -m gextv.cli QQQ        # prints + copies the string             ║
+// ║                                                                              ║
+// ║  Wire format (produced by gextv/emit.py):                                     ║
+// ║    M:key=value,key=value|L:price,label,kind;price,label,kind;...             ║
+// ║                                                                              ║
+// ║  Metadata keys in the M: header:                                             ║
+// ║    sym spot state basis asof src ng iv [rv oipc pcr ng0 ngw ngm nga]         ║
+// ║                                                                              ║
+// ║  Level kinds are <base><expiry-suffix>:                                       ║
+// ║    res/sup     call wall / put wall        res0 resw resm res                 ║
+// ║    flip        gamma flip                  flip0 flipw flipm flip            ║
+// ║    gwall       gamma wall                  gwall0 gwallw gwallm gwall        ║
+// ║    vtrig       vol trigger                                                        ║
+// ║    hgex        dominant absolute-gamma strike                                     ║
+// ║    gpos/gneg   most +/- net-GEX strike                                            ║
+// ║    mpain       max pain (computed from OI by the CLI)                             ║
+// ║    oic/oip/oimax  largest call-OI / put-OI / total-OI strike                     ║
+// ║    emh/eml     expected-move band from spot                                    ║
+// ║    ivh/ivl     1-day implied range from ATM IV                                 ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+indicator("GEX Levels — gexdash", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// ──────────────────────────────── INPUTS ────────────────────────────────
+const string TIP = "Paste the string from `python3 -m gextv.cli <SYMBOL>`. Format: M:key=value|L:price,label,kind;..."
+string srcText = input.text_area("", "GEX data string", group = "GEX Data", tooltip = TIP)
+
+// Expiry bucket visibility — each bucket is one line style.
+bool sh0   = input.bool(true,  "0DTE",   group = "Expiry buckets", inline = "e")
+bool shW   = input.bool(true,  "Weekly", group = "Expiry buckets", inline = "e")
+bool shM   = input.bool(true,  "Monthly", group = "Expiry buckets", inline = "e")
+bool shAll = input.bool(true,  "All-expiry", group = "Expiry buckets", inline = "e")
+
+// Independent levels (max pain, OI walls, EM/IV bands).
+bool shMpain = input.bool(true,  "Max pain", group = "Independent levels", inline = "i1")
+bool shOI    = input.bool(true,  "OI walls (call/put/max)", group = "Independent levels", inline = "i1")
+bool shEM    = input.bool(true,  "Expected move", group = "Independent levels", inline = "i2")
+bool shIV    = input.bool(true,  "IV 1-day range", group = "Independent levels", inline = "i2")
+
+// Style
+int    lineWidth  = input.int(1, "Line width", minval = 1, maxval = 4, group = "Style")
+int    labelOff   = input.int(8, "Label offset (bars)", minval = 0, maxval = 200, group = "Style")
+bool   showPrice  = input.bool(true, "Show price in label", group = "Style")
+string labelSize  = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = "Style")
+
+// Expiry bucket line styles (0DTE solid, Weekly dashed, Monthly dotted, All thick)
+string s0 = input.string("Solid",   "0DTE style",   options = ["Solid", "Dashed", "Dotted"], group = "Bucket styles", inline = "bs0")
+int    w0 = input.int(2,           "0DTE width",   minval = 1, maxval = 4, group = "Bucket styles", inline = "bs0")
+string sW = input.string("Dashed",  "Weekly style", options = ["Solid", "Dashed", "Dotted"], group = "Bucket styles", inline = "bs1")
+int    wW = input.int(1,           "Weekly width", minval = 1, maxval = 4, group = "Bucket styles", inline = "bs1")
+string sM = input.string("Dotted",  "Monthly style", options = ["Solid", "Dashed", "Dotted"], group = "Bucket styles", inline = "bs2")
+int    wM = input.int(1,           "Monthly width", minval = 1, maxval = 4, group = "Bucket styles", inline = "bs2")
+string sA = input.string("Solid",   "All-expiry style", options = ["Solid", "Dashed", "Dotted"], group = "Bucket styles", inline = "bs3")
+int    wA = input.int(3,           "All-expiry width", minval = 1, maxval = 4, group = "Bucket styles", inline = "bs3")
+
+// Legend / abbreviation panel
+bool   showPanel = input.bool(true, "Show legend panel", group = "Legend panel")
+string panelPos = input.string("Top right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = "Legend panel")
+string panelSize = input.string("Tiny", "Panel text size", options = ["Tiny", "Small", "Normal"], group = "Legend panel")
+
+// Colors
+color cCall   = input.color(#26A69A, "Call wall",  group = "Colors", inline = "c1")
+color cPut    = input.color(#EF5350, "Put wall",   group = "Colors", inline = "c1")
+color cFlip   = input.color(#F0B90B, "Gamma flip", group = "Colors", inline = "c2")
+color cGWall  = input.color(#F0B90B, "Gamma wall", group = "Colors", inline = "c2")
+color cVTrig  = input.color(#9C27B0, "Vol trigger", group = "Colors", inline = "c3")
+color cHGEX   = input.color(#FF9800, "HGEX",       group = "Colors", inline = "c3")
+color cGpos   = input.color(#26A69A, "G+ (pos)",   group = "Colors", inline = "c4")
+color cGneg   = input.color(#EF5350, "G- (neg)",   group = "Colors", inline = "c4")
+color cMpain  = input.color(#F0B90B, "Max pain",   group = "Colors", inline = "c5")
+color cOI     = input.color(#787B86, "OI walls",    group = "Colors", inline = "c5")
+color cEM     = input.color(#3B82F6, "Expected move", group = "Colors", inline = "c6")
+color cIV     = input.color(#7A7A85, "IV range",    group = "Colors", inline = "c6")
+
+// ──────────────────────────────── HELPERS ────────────────────────────────
+f_lineStyle(string s) =>
+    s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+
+f_size(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.small : size.normal
+
+// Strip the expiry suffix off a kind. Base kinds never end in 0/w/m, so the
+// last character alone discriminates suffix vs. base. "all" bucket has no
+// suffix.
+f_baseKind(string k) =>
+    int n = str.length(k)
+    string last = n > 0 ? str.substring(k, n - 1, n) : ""
+    (last == "0" or last == "w" or last == "m") ? str.substring(k, 0, n - 1) : k
+
+f_bucketOf(string k) =>
+    int n = str.length(k)
+    string last = n > 0 ? str.substring(k, n - 1, n) : ""
+    last == "0" ? "0dte" : last == "w" ? "weekly" : last == "m" ? "monthly" : "all"
+
+// Map a kind to its color (independent of bucket).
+f_color(string base) =>
+    base == "res"   ? cCall
+     : base == "sup"  ? cPut
+     : base == "flip" ? cFlip
+     : base == "gwall" ? cGWall
+     : base == "vtrig" ? cVTrig
+     : base == "hgex" ? cHGEX
+     : base == "gpos" ? cGpos
+     : base == "gneg" ? cGneg
+     : base == "mpain" ? cMpain
+     : base == "oic" or base == "oip" or base == "oimax" ? cOI
+     : base == "emh" or base == "eml" ? cEM
+     : base == "ivh" or base == "ivl" ? cIV
+     : color.new(#7A7A85, 30)
+
+f_bucketStyle(string bucket) =>
+    bucket == "0dte"   ? [f_lineStyle(s0), w0]
+     : bucket == "weekly"  ? [f_lineStyle(sW), wW]
+     : bucket == "monthly" ? [f_lineStyle(sM), wM]
+     : [f_lineStyle(sA), wA]  // "all"
+
+// Is a kind visible given the current settings?
+f_visible(string base, string bucket) =>
+    bool bucketOn = bucket == "0dte" ? sh0 : bucket == "weekly" ? shW : bucket == "monthly" ? shM : shAll
+    if not bucketOn
+        false
+    else if base == "res" or base == "sup" or base == "flip" or base == "gwall" or base == "vtrig" or base == "hgex" or base == "gpos" or base == "gneg"
+        true
+    else if base == "mpain"
+        shMpain
+    else if base == "oic" or base == "oip" or base == "oimax"
+        shOI
+    else if base == "emh" or base == "eml"
+        shEM
+    else if base == "ivh" or base == "ivl"
+        shIV
+    else
+        false
+
+// ──────────────────────────── METADATA PARSER ────────────────────────────
+// The M: header is M:k=v,k=v|... . Parse once on the first bar; values are
+// surfaced in the legend panel and used to label the snapshot as live vs stale.
+var string gSym     = ""
+var string gSpot    = ""
+var string gState   = ""
+var string gBasis   = ""
+var string gAsof    = ""
+var string gSrc     = ""
+var string gNetGex  = ""
+var string gIV      = ""
+var string gRV      = ""
+var string gOiPc    = ""
+
+f_meta(string header) =>
+    // header looks like "M:sym=QQQ,spot=716.08,..."
+    string h = str.startswith(header, "M:") ? str.substring(header, 2) : header
+    array<string> pairs = str.split(h, ",")
+    for pair in pairs
+        array<string> kv = str.split(pair, "=")
+        if array.size(kv) == 2
+            string key = array.get(kv, 0)
+            string val = array.get(kv, 1)
+            if key == "sym"
+                gSym := val
+            else if key == "spot"
+                gSpot := val
+            else if key == "state"
+                gState := val
+            else if key == "basis"
+                gBasis := val
+            else if key == "asof"
+                gAsof := val
+            else if key == "src"
+                gSrc := val
+            else if key == "ng"
+                gNetGex := val
+            else if key == "iv"
+                gIV := val
+            else if key == "rv"
+                gRV := val
+            else if key == "oipc"
+                gOiPc := val
+
+// ───────────────────────────── DRAW STATE ───────────────────────────────
+var array<line>  lns = array.new<line>()
+var array<label> lbs = array.new<label>()
+var label headerLabel = na
+
+// ─────────────────────────────── PARSE + DRAW ───────────────────────────
+if barstate.islast and str.length(srcText) > 0
+    // Clear previous render.
+    for l in lns
+        line.delete(l)
+    array.clear(lns)
+    for lb in lbs
+        label.delete(lb)
+    array.clear(lbs)
+    if not na(headerLabel)
+        label.delete(headerLabel)
+        headerLabel := na
+
+    // Split header (M:...) from levels (L:...). Everything before "|L:" is the
+    // header, everything after is the level list.
+    string header = ""
+    string levelStr = ""
+    if str.contains(srcText, "|L:")
+        int pipe = str.pos(srcText, "|L:")
+        header := str.substring(srcText, 0, pipe)
+        levelStr := str.substring(srcText, pipe + 3)
+    else
+        levelStr := srcText
+
+    f_meta(header)
+
+    // One small label under the last bar summarising the snapshot — tells the
+    // eye immediately whether the chart is live or carried-forward.
+    string stamp = gSym + (gSym == "" ? "" : "  ") + gNetGex + (gIV == "" ? "" : "  IV " + gIV) + (gRV == "" ? "" : "  RV " + gRV)
+    if stamp != ""
+        headerLabel := label.new(bar_index + labelOff, low - ta.tr, stamp, style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.new(#787B86, 0), size = size.tiny)
+
+    // Parse "price,label,kind;price,label,kind;..."
+    if levelStr != ""
+        array<string> rows = str.split(levelStr, ";")
+        for row in rows
+            array<string> f = str.split(row, ",")
+            if array.size(f) == 3
+                float p = str.tonumber(array.get(f, 0))
+                string lbl = array.get(f, 1)
+                string kind = array.get(f, 2)
+                if not na(p) and p > 0
+                    string base = f_baseKind(kind)
+                    string bucket = f_bucketOf(kind)
+                    if f_visible(base, bucket)
+                        color c = f_color(base)
+                        [int st, int wid] = f_bucketStyle(bucket)
+                        // The "All" bucket renders a touch wider and is drawn
+                        // first so the per-expiry lines sit on top of it.
+                        int useW = bucket == "all" ? math.max(wid, 2) : wid
+                        array.push(lns, line.new(bar_index - 1, p, bar_index, p, extend = extend.both, color = c, width = useW, style = st))
+                        if labelOff >= 0
+                            string txt = showPrice ? lbl + "  " + str.tostring(p, format.mintick) : lbl
+                            array.push(lbs, label.new(bar_index + labelOff, p, txt, style = label.style_label_left, color = color.new(color.black, 100), textcolor = c, size = f_size(labelSize)))
+
+// ─────────────────────────── LEGEND / ABBREVIATION PANEL ─────────────────
+// Surfaces (a) the snapshot status and (b) what every abbreviation means, so a
+// viewer who did not author the string can still read the chart. Position is
+// user-selectable so it does not fight the price axis on any layout.
+var table panel = table.new(position.top_right, 2, 18, border_width = 0)
+
+f_panelPos() =>
+    panelPos == "Top right" ? position.top_right
+     : panelPos == "Top left" ? position.top_left
+     : panelPos == "Bottom right" ? position.bottom_right
+     : position.bottom_left
+
+if showPanel and barstate.islast
+    // Rebuild at the chosen position each time settings change.
+    table.clear(panel, 0, 0, 1, 17)
+    // table.position is fixed at construction; when the user flips position we
+    // recreate the table. Pine has no table.set_position, so detect a change
+    // via a var guard.
+    var string lastPos = ""
+    if lastPos != panelPos
+        lastPos := panelPos
+        panel := table.new(f_panelPos(), 2, 18, border_width = 0)
+
+    int pSz = panelSize == "Tiny" ? size.tiny : panelSize == "Small" ? size.small : size.normal
+    int r = 0
+
+    // Header row: symbol + snapshot basis (live / prior-close).
+    table.cell(panel, 0, r, "GEX " + (gSym == "" ? "?" : gSym), text_color = #F0B90B, text_size = pSz, text_halign = text.align_left)
+    table.cell(panel, 1, r, gBasis == "" ? "" : gBasis, text_color = gBasis == "today-live" ? #26A69A : #787B86, text_size = pSz, text_halign = text.align_left)
+    r += 1
+
+    // Snapshot line: spot, net gamma, IV / RV, age.
+    table.cell(panel, 0, r, "spot / netGEX", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+    table.cell(panel, 1, r, (gSpot == "" ? "—" : gSpot) + "  " + (gNetGex == "" ? "" : gNetGex), text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
+    r += 1
+    if gIV != "" or gRV != ""
+        table.cell(panel, 0, r, "IV / RV %", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+        table.cell(panel, 1, r, (gIV == "" ? "—" : gIV) + " / " + (gRV == "" ? "—" : gRV), text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
+        r += 1
+    if gAsof != ""
+        table.cell(panel, 0, r, "as of (UTC)", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+        // Trim the fractional seconds for the panel.
+        table.cell(panel, 1, r, str.substring(gAsof, 0, math.min(str.length(gAsof), 19)) + "Z", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+        r += 1
+    if gOiPc != ""
+        table.cell(panel, 0, r, "OI P/C", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+        table.cell(panel, 1, r, gOiPc, text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
+        r += 1
+
+    // Separator.
+    r += 0
+    table.cell(panel, 0, r, "─ levels ─", text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+    table.cell(panel, 1, r, "", text_color = #787B86, text_size = pSz)
+    r += 1
+
+    // Abbreviation glossary. Each row: short name → explanation.
+    array<string> names  = array.from("CW / PW", "flip", "gwall", "vtrig", "hgex", "G+ / G-", "mpain", "oic/oip", "emh/eml", "ivh/ivl")
+    array<string> expls  = array.from("call / put wall", "gamma flip", "gamma wall", "vol trigger", "max |GEX| strike", "most ± net-GEX", "max pain (OI)", "largest OI strike", "expected move ±", "1-day IV range")
+    for i = 0 to array.size(names) - 1
+        table.cell(panel, 0, r, array.get(names, i), text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
+        table.cell(panel, 1, r, array.get(expls, i), text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+        r += 1
+
+    // Bucket legend: which line style is which expiry.
+    table.cell(panel, 0, r, "0DTE", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
+    table.cell(panel, 1, r, s0 + " w" + str.tostring(w0), text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+    r += 1
+    table.cell(panel, 0, r, "Weekly", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
+    table.cell(panel, 1, r, sW + " w" + str.tostring(wW), text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+    r += 1
+    table.cell(panel, 0, r, "Monthly", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
+    table.cell(panel, 1, r, sM + " w" + str.tostring(wM), text_color = #787B86, text_size = pSz, text_halign = text.align_left)
+    r += 1
+    table.cell(panel, 0, r, "All-exp", text_color = #E8E6E1, text_size = pSz, text_halign = text.align_left)
+    table.cell(panel, 1, r, sA + " w" + str.tostring(wA), text_color = #787B86, text_size = pSz, text_halign = text.align_left)
