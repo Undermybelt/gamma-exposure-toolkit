@@ -31,6 +31,11 @@ indicator("GEX Levels — gexdash", overlay = true, max_lines_count = 500, max_l
 // ──────────────────────────────── INPUTS ────────────────────────────────
 const string TIP = "Paste the string from `python3 -m gextv.cli <SYMBOL>`. Format: M:key=value|L:price,label,kind;..."
 string srcText = input.text_area("", "GEX data string", group = "GEX Data", tooltip = TIP)
+bool basisShift = input.bool(true, "基差换算（贴到期货图时开启）", group = "GEX Data", tooltip =
+     "把字符串贴到非同品种图表时的加法平移：基差 = 图表现价 − 数据源spot，全部价位整体平移。\n"
+     + "适用：NDX字符串→NQ图、SPX字符串→ES图（指数↔期货）。\n"
+     + "贴在同品种图（NDX串贴NDX图）基差≈0，无影响。\n"
+     + "不适用于倍数关系的品种（SPY/SPX、QQQ/NDX）。")
 
 // Expiry bucket visibility — each bucket is one line style.
 bool sh0   = input.bool(true,  "0DTE",   group = "Expiry buckets", inline = "e")
@@ -152,6 +157,7 @@ f_visible(string base, string bucket) =>
 // surfaced in the legend panel and used to label the snapshot as live vs stale.
 var string gSym     = ""
 var string gSpot    = ""
+var float  gSpotF   = na  // numeric data-source spot, for the basis shift
 var string gState   = ""
 var string gBasis   = ""
 var string gAsof    = ""
@@ -211,6 +217,7 @@ if barstate.islast and str.length(srcText) > 0
                 gSym := val
             else if key == "spot"
                 gSpot := val
+                gSpotF := str.tonumber(val)
             else if key == "state"
                 gState := val
             else if key == "basis"
@@ -228,9 +235,16 @@ if barstate.islast and str.length(srcText) > 0
             else if key == "oipc"
                 gOiPc := val
 
+    // Basis shift: additive conversion when the string's home symbol differs
+    // from the chart symbol (NDX string on an NQ chart, SPX on ES). basis =
+    // chart price now − data-source spot at snapshot time. On a same-symbol
+    // chart it collapses to ~0. Ratio-type pairs (SPY/SPX, QQQ/NDX) are NOT
+    // handled — turn the toggle off there.
+    float basis = basisShift and not na(gSpotF) and gSpotF > 0 ? close - gSpotF : 0.0
+
     // One small label under the last bar summarising the snapshot — tells the
     // eye immediately whether the chart is live or carried-forward.
-    string stamp = gSym + (gSym == "" ? "" : "  ") + gNetGex + (gIV == "" ? "" : "  IV " + gIV) + (gRV == "" ? "" : "  RV " + gRV)
+    string stamp = gSym + (gSym == "" ? "" : "  ") + gNetGex + (gIV == "" ? "" : "  IV " + gIV) + (gRV == "" ? "" : "  RV " + gRV) + (math.abs(basis) > syminfo.mintick ? "  基差" + (basis > 0 ? "+" : "") + str.tostring(basis, "#.#") : "")
     if stamp != ""
         headerLabel := label.new(bar_index + labelOff, low - ta.tr, stamp, style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.new(#787B86, 0), size = size.tiny)
 
@@ -247,6 +261,7 @@ if barstate.islast and str.length(srcText) > 0
                 string lbl = array.get(f, 1)
                 string kind = array.get(f, 2)
                 if not na(p) and p > 0
+                    float y = p + basis  // chart-space price after the basis shift
                     string base = f_baseKind(kind)
                     string bucket = f_bucketOf(kind)
                     if f_visible(base, bucket)
@@ -259,11 +274,11 @@ if barstate.islast and str.length(srcText) > 0
                         // The "All" bucket renders a touch wider and is drawn
                         // first so the per-expiry lines sit on top of it.
                         int useW = bucket == "all" ? math.max(wid, 2) : wid
-                        array.push(lns, line.new(bar_index - 1, p, bar_index, p, extend = extend.both, color = c, width = useW, style = st))
+                        array.push(lns, line.new(bar_index - 1, y, bar_index, y, extend = extend.both, color = c, width = useW, style = st))
                         dbgDrawn += 1
                         if labelOff >= 0
-                            string txt = showPrice ? lbl + "  " + str.tostring(p, format.mintick) : lbl
-                            array.push(lbs, label.new(bar_index + labelOff, p, txt, style = label.style_label_left, color = color.new(color.black, 100), textcolor = c, size = f_size(labelSize)))
+                            string txt = showPrice ? lbl + "  " + str.tostring(y, format.mintick) : lbl
+                            array.push(lbs, label.new(bar_index + labelOff, y, txt, style = label.style_label_left, color = color.new(color.black, 100), textcolor = c, size = f_size(labelSize)))
 
 // ─────────────────────────── LEGEND / ABBREVIATION PANEL ─────────────────
 // Surfaces (a) the snapshot status and (b) what every abbreviation means, so a
@@ -351,6 +366,6 @@ if showPanel and barstate.islast
 var table dbg = table.new(position.top_left, 1, 1)
 if showDebug and barstate.islast
     int dLen = str.length(srcText)
-    string dbgMsg = "数据 " + str.tostring(dLen) + " 字 · 行 " + str.tostring(dbgRows) + " · 画 " + str.tostring(dbgDrawn) + (gSym == "" ? "" : " · " + gSym)
+    string dbgMsg = "数据 " + str.tostring(dLen) + " 字 · 行 " + str.tostring(dbgRows) + " · 画 " + str.tostring(dbgDrawn) + (gSym == "" ? "" : " · " + gSym) + (na(basis) or basis == 0 ? "" : " · 基差" + (basis > 0 ? "+" : "") + str.tostring(basis, "#.#"))
     color dbgBg = dLen == 0 ? color.new(#EF5350, 10) : dbgDrawn == 0 ? color.new(#F0B90B, 10) : color.new(#26A69A, 10)
     table.cell(dbg, 0, 0, dbgMsg, text_color = color.white, text_size = size.small, bgcolor = dbgBg)
