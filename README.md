@@ -17,7 +17,7 @@ python3 -m gextv.cli QQQ     # prints + copies the string
 
 ### B. Chrome extension (one-click)
 
-For no-copy-paste: load `extension/` as an unpacked extension. It fetches gexdash from its background worker, builds the **same** level string the CLI does, and fills the indicator's data field with one click (clipboard fallback if it cannot find the field). It can also **auto-poll** — default every 1 minute, since gexdash's own snapshot refreshes every 30 s — and an optional **full-auto** mode reopens the settings dialog and clicks OK for you, so the chart refreshes end-to-end with zero manual steps. See `extension/README.md`.
+For no-copy-paste: load `extension/` as an unpacked extension. It fetches gexdash from its background worker, builds the **same** level string the CLI does, and fills the indicator's data field with one click (clipboard fallback if it cannot find the field). It can also **auto-poll** — default every 1 minute, since gexdash's own snapshot refreshes every 30 s — and an optional **full-auto** mode reopens the settings dialog and clicks OK for you (US Eastern RTH only — outside 09:30–16:00 the snapshot is prior-close data, so the auto tick skips). See `extension/README.md`.
 
 Why a bridge is needed: TradingView's Pine sandbox cannot reach `gexdash.com` — Pine has no HTTP-fetch primitive, only `request.security` for exchange data. The indicator itself stays a pure string-parsing Pine script; the bridge (CLI or extension) does the network work that Pine is not allowed to do.
 

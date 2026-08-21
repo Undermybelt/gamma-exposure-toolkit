@@ -21,7 +21,12 @@ TradingView's Pine sandbox cannot reach `gexdash.com`, so the indicator still on
 ### Auto-poll and full-auto
 
 - **自动刷新** re-fetches gexdash on an interval and rewrites the field. It defaults to **every 1 minute** — gexdash's own snapshot updates every 30 s, so one minute is enough — until you save an explicit choice; 关 turns it off and is remembered.
-- **全自动（自动开设置+点OK）** closes the loop: after filling the field it clicks the settings dialog's OK button for you, and when the dialog is closed it reopens it through the indicator's ⚙ button. To arm that path, click **绑定输入框** and then click the ⚙ button (instead of the textarea) — the extension binds it as the reopen handle. With full-auto on, data flows from gexdash to a committed chart with zero manual steps; if the OK button can't be found, the status line says so and the string is still in the clipboard.
+- **全自动·仅RTH（自动开设置+点OK）** closes the loop: after filling the field it clicks the settings dialog's OK button for you, and when the dialog is closed it reopens it through the indicator's ⚙ button. To arm that path, click **绑定输入框** and then click the ⚙ button (instead of the textarea) — the extension binds it as the reopen handle. With full-auto on, data flows from gexdash to a committed chart with zero manual steps; if the OK button can't be found, the status line says so and the string is still in the clipboard.
+- **Full-auto runs only during US Eastern regular hours** (Mon–Fri 09:30–16:00 America/New_York, checked via the browser's own timezone database). Outside RTH the automatic tick skips entirely — gexdash serves the prior-close chain then, and auto-OK would just re-commit stale data. Manual 「加载并填入」 clicks work at any hour.
+
+### After reloading/updating the extension
+
+Chrome keeps the old content script alive in already-open tabs while its API bindings die, which surfaces as `Extension context invalidated.` The panel now catches this on any chrome call, stops the poll timer, and shows 「扩展已重载或更新 — 请刷新 TradingView 页面后再用」. The fix is what it says: refresh the tab so a fresh script instance is injected.
 
 ### Why there are two fill paths
 

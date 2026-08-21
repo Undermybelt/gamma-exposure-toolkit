@@ -24,6 +24,16 @@
 // routes the panel's own actions by delegation (stopping propagation at window
 // also prevents the panel's own element-level listeners from firing, so
 // delegation in the guard is the only way to handle them).
+//
+// CONTEXT LIFETIME: reloading or updating the extension orphans this script
+// inside the still-open tab; every chrome.* call from it then throws
+// "Extension context invalidated." extAlive() guards each chrome call site,
+// kills the poll timer on first failure, and tells the user to refresh.
+//
+// RTH GATE: full-auto only acts during US Eastern regular hours (Mon–Fri
+// 09:30–16:00 America/New_York). Outside RTH gexdash serves the prior-close
+// chain, so auto-opening settings + clicking OK would just re-commit stale
+// data every minute. Manual 「加载并填入」 clicks are never gated.
 
 const DEFAULT_SYMBOL_KEY = "gextv:defaultSymbol";
 const POSITION_KEY = "gextv:panelPos"; // {x, y}
@@ -46,24 +56,75 @@ let pollBusy = false;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ── extension-context guard ───────────────────────────────────────────────
+// Reloading/updating the extension orphans the content script already living
+// in this tab: every chrome.* binding then throws "Extension context
+// invalidated." (seen at the symbol-select's storage.set). extAlive() checks
+// the context once per call and, on the first failure, tears the poll timer
+// down and points the user at the real fix — a page refresh. setStatus below
+// is plain DOM, so it still works from an orphaned script.
+let ctxDead = false;
+function extAlive() {
+  if (ctxDead) return false;
+  try {
+    if (!chrome.runtime || !chrome.runtime.id) throw new Error("context gone");
+    return true;
+  } catch {
+    ctxDead = true;
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    setStatus("⚠ 扩展已重载或更新 — 请刷新 TradingView 页面后再用", "#EF5350");
+    return false;
+  }
+}
+
+// ── US Eastern regular hours ──────────────────────────────────────────────
+// Full-auto opens the settings dialog and clicks OK — committing whatever the
+// snapshot holds. Outside RTH gexdash serves the prior-close chain, so doing
+// that every minute would just re-commit stale data (and slam the dialog in
+// the user's face overnight). isRTH() gates the automatic path to Mon–Fri
+// 09:30–16:00 America/New_York via Intl, so the host machine's timezone is
+// irrelevant. Manual 「加载并填入」 clicks are never gated.
+function isRTH(now = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      weekday: "short",
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).formatToParts(now);
+    const get = (t) => { const p = parts.find(x => x.type === t); return p ? p.value : ""; };
+    if (get("weekday") === "Sat" || get("weekday") === "Sun") return false;
+    const mins = parseInt(get("hour"), 10) * 60 + parseInt(get("minute"), 10);
+    return mins >= 9 * 60 + 30 && mins < 16 * 60;
+  } catch {
+    return true; // Intl/timezone data unavailable — fail open, keep old behavior
+  }
+}
+
 // ── persistence helpers ───────────────────────────────────────────────────
 function loadDefaultSymbol() {
-  return new Promise(resolve => chrome.storage.local.get(DEFAULT_SYMBOL_KEY, r =>
-    resolve(r[DEFAULT_SYMBOL_KEY] || "QQQ")));
+  return new Promise(resolve => {
+    if (!extAlive()) { resolve("QQQ"); return; }
+    chrome.storage.local.get(DEFAULT_SYMBOL_KEY, r =>
+      resolve(r[DEFAULT_SYMBOL_KEY] || "QQQ"));
+  });
 }
 function saveDefaultSymbol(sym) {
+  if (!extAlive()) return;
   currentSymbol = sym;
   chrome.storage.local.set({ [DEFAULT_SYMBOL_KEY]: sym });
 }
 function loadState() {
-  return new Promise(resolve => chrome.storage.local.get(
-    [POSITION_KEY, COLLAPSED_KEY], r => resolve({
-      pos: r[POSITION_KEY] || null,
-      collapsed: r[COLLAPSED_KEY] || false,
-    })));
+  return new Promise(resolve => {
+    if (!extAlive()) { resolve({ pos: null, collapsed: false }); return; }
+    chrome.storage.local.get(
+      [POSITION_KEY, COLLAPSED_KEY], r => resolve({
+        pos: r[POSITION_KEY] || null,
+        collapsed: r[COLLAPSED_KEY] || false,
+      }));
+  });
 }
-function savePos(pos) { chrome.storage.local.set({ [POSITION_KEY]: pos }); }
-function saveCollapsed(c) { chrome.storage.local.set({ [COLLAPSED_KEY]: c }); }
+function savePos(pos) { if (extAlive()) chrome.storage.local.set({ [POSITION_KEY]: pos }); }
+function saveCollapsed(c) { if (extAlive()) chrome.storage.local.set({ [COLLAPSED_KEY]: c }); }
 
 // ── clipboard ─────────────────────────────────────────────────────────────
 async function copyToClipboard(text) {
@@ -230,8 +291,16 @@ function clickDialogOk(ta) {
   return false;
 }
 
-async function doFetchAndFill(prefix) {
+async function doFetchAndFill(prefix, isAutoTick = false) {
   if (pollBusy) return;
+  if (!extAlive()) return;
+  // RTH gate: full-auto ticks outside US regular hours do nothing — the
+  // snapshot would be prior-close data, and auto-OK would commit it stale.
+  // Manual clicks (isAutoTick=false) bypass the gate on purpose.
+  if (isAutoTick && autoFull && !isRTH()) {
+    setStatus("全自动待盘：仅美东周一–五 09:30–16:00（RTH）运行，当前盘外", "#787B86");
+    return;
+  }
   pollBusy = true;
   setStatus(prefix + "正在从 gexdash 获取…", "#3B82F6");
   chrome.runtime.sendMessage({ type: "fetchGex", symbol: currentSymbol }, async (resp) => {
@@ -296,8 +365,8 @@ function onLoadClick() {
 function applyPoll(min) {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   if (min > 0) {
-    pollTimer = setInterval(() => doFetchAndFill("[自动] "), min * 60000);
-    doFetchAndFill("[自动] ");
+    pollTimer = setInterval(() => doFetchAndFill("[自动] ", true), min * 60000);
+    doFetchAndFill("[自动] ", true);
     setStatus(`自动刷新已开启：每 ${min} 分钟（写入需设置框开着；剪贴板始终更新）`, "#3B82F6");
   }
 }
@@ -439,16 +508,17 @@ async function buildPanel() {
   body.appendChild(poll);
 
   // Full-auto toggle: fill + auto-OK, reopening the dialog via the bound ⚙.
+  // RTH-gated: outside US regular hours the tick skips entirely.
   const autoWrap = document.createElement("label");
   autoWrap.style.display = "flex";
   autoWrap.style.alignItems = "center";
   autoWrap.style.gap = "6px";
-  autoWrap.title = "全自动：填入后自动点OK提交；设置框没开时经绑定的⚙按钮自动打开。先用「绑定输入框」点一下指标的⚙。";
+  autoWrap.title = "全自动：填入后自动点OK提交；设置框没开时经绑定的⚙按钮自动打开。仅美东周一–五 09:30–16:00（RTH）运行，盘外定时跳过。先用「绑定输入框」点一下指标的⚙。";
   const autoCb = document.createElement("input");
   autoCb.type = "checkbox";
   autoCb.style.margin = "0";
   autoWrap.appendChild(autoCb);
-  autoWrap.appendChild(document.createTextNode("全自动（自动开设置+点OK）"));
+  autoWrap.appendChild(document.createTextNode("全自动·仅RTH（自动开设置+点OK）"));
   body.appendChild(autoWrap);
 
   const status = document.createElement("div");
@@ -474,18 +544,20 @@ async function buildPanel() {
   // 'change' is not a guarded event, so plain listeners work for the selects.
   select.addEventListener("change", () => saveDefaultSymbol(select.value));
   poll.addEventListener("change", () => {
+    if (!extAlive()) return;
     const min = parseInt(poll.value, 10) || 0;
     chrome.storage.local.set({ [POLL_KEY]: min });
     applyPoll(min);
   });
   autoCb.addEventListener("change", () => {
+    if (!extAlive()) return;
     autoFull = autoCb.checked;
     chrome.storage.local.set({ [AUTO_KEY]: autoFull });
     if (autoFull && !openerEl && !boundTarget)
-      setStatus("全自动已开：先用「绑定输入框」点一下指标的⚙按钮", "#F0B90B");
+      setStatus("全自动已开：先用「绑定输入框」点一下指标的⚙按钮（仅RTH生效）", "#F0B90B");
   });
   loadDefaultSymbol().then(sym => { select.value = sym; currentSymbol = sym; });
-  chrome.storage.local.get([POLL_KEY, AUTO_KEY], r => {
+  if (extAlive()) chrome.storage.local.get([POLL_KEY, AUTO_KEY], r => {
     // Default to 1 minute (gexdash refreshes every 30s) until the user saves
     // an explicit choice; an explicit 关 (0) stays off.
     const min = r[POLL_KEY] === undefined ? 1 : r[POLL_KEY];
