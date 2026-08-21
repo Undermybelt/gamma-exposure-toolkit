@@ -30,7 +30,7 @@ indicator("GEX Levels — gexdash", overlay = true, max_lines_count = 500, max_l
 
 // ──────────────────────────────── INPUTS ────────────────────────────────
 const string TIP = "Paste the string from `python3 -m gextv.cli <SYMBOL>`. Format: M:key=value|L:price,label,kind;..."
-const string IND_VER = "v8"
+const string IND_VER = "v9"
 string srcText = input.text_area("", "GEX data string", group = "GEX Data", tooltip = TIP)
 string basisMode = input.string("自动", "价位换算（贴到别的品种图时用）", group = "GEX Data", options =
      ["自动", "关闭（原价）", "×10", "÷10（微合约/SPY）", "÷40（QQQ≈NDX，近似）"], tooltip =
@@ -56,6 +56,11 @@ int    lineWidth  = input.int(1, "Line width", minval = 1, maxval = 4, group = "
 int    labelOff   = input.int(8, "Label offset (bars)", minval = 0, maxval = 200, group = "Style")
 bool   showPrice  = input.bool(true, "Show price in label", group = "Style")
 string labelSize  = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = "Style")
+string labelSide   = input.string("自动错开", "标签位置", options = ["自动错开", "线上方", "线下方", "线上居中"], group = "Style", tooltip =
+     "自动错开：所有标签先按价位排序，相邻两个价格差小于阈值时一上一下交替放置，避免文字重叠。\n"
+     + "线上方/线下方：全部标签统一放线上方/下方。\n"
+     + "线上居中：标签气泡中线对齐价位（旧默认样式）。")
+float  labelGapPct = input.float(0.05, "自动错开：相邻间距阈值（价格%）", minval = 0.001, maxval = 5.0, step = 0.01, group = "Style", tooltip = "相邻标签价格差小于当前价的此百分比时视为重叠，上下交替错开。数值越大越早错开。")
 bool   showDebug  = input.bool(true,  "调试行（排查显示用）", group = "Style")
 
 // Expiry bucket line styles (0DTE solid, Weekly dashed, Monthly dotted, All thick)
@@ -270,11 +275,17 @@ if barstate.islast and str.length(srcText) > 0
         headerLabel := label.new(bar_index + labelOff, low - ta.tr, stamp, style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.new(#787B86, 0), size = size.tiny)
 
     // Parse "price,label,kind;price,label,kind;..."
+    // Two passes: lines draw immediately; labels are collected, sorted by
+    // price, then placed above/below so near-adjacent levels don't stack into
+    // unreadable mush.
     dbgRows := 0
     dbgDrawn := 0
     if levelStr != ""
         array<string> rows = str.split(levelStr, ";")
         dbgRows := array.size(rows)
+        float[]  lblY   = array.new_float()
+        string[] lblTxt = array.new_string()
+        color[]  lblCol = array.new_color()
         for row in rows
             array<string> f = str.split(row, ",")
             if array.size(f) == 3
@@ -297,9 +308,49 @@ if barstate.islast and str.length(srcText) > 0
                         int useW = bucket == "all" ? math.max(wid, 2) : wid
                         array.push(lns, line.new(bar_index - 1, y, bar_index, y, extend = extend.both, color = c, width = useW, style = st))
                         dbgDrawn += 1
-                        if labelOff >= 0
-                            string txt = showPrice ? lbl + "  " + str.tostring(y, format.mintick) : lbl
-                            array.push(lbs, label.new(bar_index + labelOff, y, txt, style = label.style_label_left, color = color.new(color.black, 100), textcolor = c, size = f_size(labelSize)))
+                        string txt = showPrice ? lbl + "  " + str.tostring(y, format.mintick) : lbl
+                        array.push(lblY, y)
+                        array.push(lblTxt, txt)
+                        array.push(lblCol, c)
+
+        // ── labels: sort by price, then place above/below ──
+        int nL = array.size(lblY)
+        if nL > 0
+            // Parallel bubble sort ascending by y (n ≈ 40; same trick as the
+            // reference scripts' confluence sort).
+            for i = 0 to nL - 2
+                for j = 0 to nL - i - 2
+                    if array.get(lblY, j) > array.get(lblY, j + 1)
+                        float ty = array.get(lblY, j)
+                        array.set(lblY, j, array.get(lblY, j + 1))
+                        array.set(lblY, j + 1, ty)
+                        string tt = array.get(lblTxt, j)
+                        array.set(lblTxt, j, array.get(lblTxt, j + 1))
+                        array.set(lblTxt, j + 1, tt)
+                        color tc = array.get(lblCol, j)
+                        array.set(lblCol, j, array.get(lblCol, j + 1))
+                        array.set(lblCol, j + 1, tc)
+
+            float gapPx = close * labelGapPct / 100.0
+            bool above = true
+            float prevY = na
+            for i = 0 to nL - 1
+                float y = array.get(lblY, i)
+                string txt = array.get(lblTxt, i)
+                color c = array.get(lblCol, i)
+                lstyle = label.style_label_left
+                if labelSide == "自动错开"
+                    if na(prevY) or (y - prevY) > gapPx
+                        above := true   // clear of the previous label: reset to top
+                    else
+                        above := not above
+                    lstyle := above ? label.style_label_up : label.style_label_down
+                else if labelSide == "线上方"
+                    lstyle := label.style_label_up
+                else if labelSide == "线下方"
+                    lstyle := label.style_label_down
+                prevY := y
+                array.push(lbs, label.new(bar_index + labelOff, y, txt, style = lstyle, color = color.new(color.black, 100), textcolor = c, size = f_size(labelSize)))
 
 // ─────────────────────────── LEGEND / ABBREVIATION PANEL ─────────────────
 // Surfaces (a) the snapshot status and (b) what every abbreviation means, so a
