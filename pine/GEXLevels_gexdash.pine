@@ -269,7 +269,7 @@ if barstate.islast and str.length(srcText) > 0
 // Surfaces (a) the snapshot status and (b) what every abbreviation means, so a
 // viewer who did not author the string can still read the chart. Position is
 // user-selectable so it does not fight the price axis on any layout.
-var table panel = table.new(position.top_right, 2, 18, border_width = 0)
+var table panel = table.new(position.top_right, 2, 24, border_width = 0)
 
 f_panelPos() =>
     panelPos == "Top right" ? position.top_right
@@ -279,14 +279,14 @@ f_panelPos() =>
 
 if showPanel and barstate.islast
     // Rebuild at the chosen position each time settings change.
-    table.clear(panel, 0, 0, 1, 17)
+    table.clear(panel, 0, 0, 1, 23)
     // table.position is fixed at construction; when the user flips position we
     // recreate the table. Pine has no table.set_position, so detect a change
     // via a var guard.
     var string lastPos = ""
     if lastPos != panelPos
         lastPos := panelPos
-        panel := table.new(f_panelPos(), 2, 18, border_width = 0)
+        panel := table.new(f_panelPos(), 2, 24, border_width = 0)
 
     // size.* constants are a distinct type, not int — leave pSz untyped so Pine
     // infers it from the ternary (CE10173 if declared `int`).
